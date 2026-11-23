@@ -102,11 +102,11 @@ jobs:
             requirements-dev.txt
             constraints.txt
 
-      - name: Linux system packages (virtual display for the GUI, OpenGL for MediaPipe)
+      - name: Linux system packages (virtual display for the GUI; OpenGL / GLES libraries MediaPipe loads)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xvfb libgl1 libegl1
+          sudo apt-get install -y --no-install-recommends xvfb libgl1 libegl1 libgles2
 
       - name: Python packages
         run: |

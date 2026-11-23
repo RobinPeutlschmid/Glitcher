@@ -35,6 +35,27 @@ HERE = Path(__file__).resolve().parent
 NAME = "Glitcher"
 
 
+CV2_PLACEHOLDER = '''"""PyInstaller runtime hook written by build_portable.py: a placeholder "cv2" module.
+
+MediaPipe's vision package imports OpenCV at import time, but only its drawing helpers use it,
+and Glitcher never calls them. The packaged app leaves OpenCV out; this stands in for it so the
+import succeeds. Anything that really asks OpenCV for something gets a clear error.
+"""
+import sys
+import types
+
+
+def _missing(name):
+    raise AttributeError(f"cv2.{name}: OpenCV is not included in the packaged Glitcher")
+
+
+if "cv2" not in sys.modules:
+    _m = types.ModuleType("cv2", "placeholder: OpenCV is not included in the packaged Glitcher")
+    _m.__getattr__ = _missing
+    sys.modules["cv2"] = _m
+'''
+
+
 def arch() -> str:
     """CPU architecture for the zip name: x64 or arm64 (what the built app runs on)."""
     m = platform.machine().lower()
@@ -80,6 +101,13 @@ def main() -> int:
         cmd += ["--exclude-module", "mediapipe"]
     else:
         cmd += ["--collect-all", "mediapipe", "--hidden-import", "mediapipe.tasks.c"]
+        # MediaPipe imports OpenCV (cv2) only for drawing helpers Glitcher never calls. Leave the
+        # real OpenCV out (~110 MB, and its self-loader breaks inside a macOS .app: "recursion
+        # is detected during loading of cv2") and give MediaPipe a placeholder module instead.
+        (HERE / "build").mkdir(exist_ok=True)
+        stub = HERE / "build" / "pyi_rth_cv2_placeholder.py"
+        stub.write_text(CV2_PLACEHOLDER, encoding="utf-8")
+        cmd += ["--exclude-module", "cv2", "--runtime-hook", str(stub)]
         models = [p for v in ("heavy", "full", "lite")
                   for p in (HERE / f"pose_landmarker_{v}.task",
                             Path.home() / ".cache" / "estimate_pose" / f"pose_landmarker_{v}.task")

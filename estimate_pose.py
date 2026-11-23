@@ -247,12 +247,26 @@ NO_MEDIAPIPE = ("pose estimation needs MediaPipe, which this build doesn't inclu
                 "existing landmark cache still works.")
 
 
+_MP_ERROR: ImportError | None = None
+
+
 def _have_mediapipe() -> bool:
+    global _MP_ERROR
     try:
         import mediapipe  # noqa: F401
         return True
-    except ImportError:
+    except ImportError as ex:
+        _MP_ERROR = ex
         return False
+
+
+def _no_mediapipe() -> str:
+    """Why pose estimation is unavailable: not installed / left out of the build, or installed
+    but failing to load (then the real error is what helps, e.g. a missing library)."""
+    ex = _MP_ERROR
+    if ex is not None and ex.name != "mediapipe":
+        return f"MediaPipe is installed but failed to load: {type(ex).__name__}: {ex}"
+    return NO_MEDIAPIPE
 
 
 def resolve_model(path: str | None, variant: str) -> str:
@@ -291,7 +305,7 @@ def self_check(model_path: str | None = None, variant: str = "heavy") -> int:
     release builds to prove a packaged app can really estimate poses (a missing native library
     or model only shows up when the detector is created). 0 = works, 3 = doesn't."""
     if not _have_mediapipe():
-        print("pose check FAILED: " + NO_MEDIAPIPE, file=sys.stderr)
+        print("pose check FAILED: " + _no_mediapipe(), file=sys.stderr)
         return 3
     try:
         import mediapipe as mp
@@ -794,7 +808,7 @@ def main(argv=None) -> int:
     model = None
     if args.model or not (args.cache and args.cache.is_file()):
         if not _have_mediapipe():
-            print("error: " + NO_MEDIAPIPE, file=sys.stderr)
+            print("error: " + _no_mediapipe(), file=sys.stderr)
             return 2
         try:
             model = resolve_model(args.model, args.variant)
@@ -817,7 +831,7 @@ def main(argv=None) -> int:
             print(f"ignoring unreadable cache {args.cache} ({type(ex).__name__})", file=sys.stderr)
     if F is None:
         if not _have_mediapipe():
-            print("error: " + NO_MEDIAPIPE, file=sys.stderr)
+            print("error: " + _no_mediapipe(), file=sys.stderr)
             return 2
         if model is None:
             try:
