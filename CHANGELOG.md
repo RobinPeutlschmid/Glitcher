@@ -3,6 +3,10 @@
 Version numbers: MAJOR.MINOR.PATCH. The version lives in one place, `__version__` in glitch.py;
 the GUI title, `--version` of every tool, saved presets and the portable build's zip name read it
 from there.
+## 1.3.1 — 2026-11-23
+### Fixed
+- Fixed issues with Mac and Linux builds
+
 
 ## 1.3.0 — 2026-11-23
 
