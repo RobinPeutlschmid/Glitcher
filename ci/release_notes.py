@@ -4,6 +4,10 @@
     python ci/release_notes.py --check-tag v1.3.0     fail unless the tag is v + glitch.__version__
                                                       and CHANGELOG.md has an entry for it
     python ci/release_notes.py > notes.md             that version's CHANGELOG section (release text)
+    python ci/release_notes.py --print-version        just the version, e.g. 1.3.0
+
+Reads glitch.py as text instead of importing it, so it runs on a bare Python with no
+packages installed (importing glitch.py needs NumPy and Pillow).
 """
 import argparse
 import re
@@ -29,8 +33,12 @@ def section(v: str) -> str | None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--check-tag", metavar="TAG")
+    ap.add_argument("--print-version", action="store_true")
     a = ap.parse_args()
     v = version()
+    if a.print_version:
+        print(v)
+        return 0
     if a.check_tag is not None:
         tag = a.check_tag.removeprefix("refs/tags/")
         if tag != f"v{v}":
