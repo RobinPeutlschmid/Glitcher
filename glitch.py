@@ -190,7 +190,7 @@ from __future__ import annotations
 import argparse
 import copy
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 APP_NAME = "Glitcher"
 import glob as _glob
 import json
@@ -2801,11 +2801,67 @@ class SeqHistory:
         return (str(self.paths[k - 1]), self.size, pk)
 
 
+# --------------------------------------------------------------------------- glitch pass (matte)
+PASS_LO, PASS_HI = 2.0, 64.0      # 8-bit difference: <= LO unchanged (rounding), >= HI white
+
+
+def glitch_pass(out, img, plate=None, pad=(0, 0)) -> np.ndarray:
+    """Matte of the pixels the glitch made, float32 0..1 at the output's size.
+
+    A pixel counts as glitch when the output is neither the clean subject (the input on the same
+    canvas, over the plate in comp mode) nor the clean background (transparency, or the plate).
+    So blocks, smears, echoes, held frames, transitions and spill into the plate are white;
+    the untouched subject, holes that show the background, and empty frames are black.
+    Grey levels say how strongly a pixel changed (linear from PASS_LO to PASS_HI levels of 255),
+    so the comp can pick its own threshold: a Levels / Threshold on the pass keeps only the hard
+    glitches (displaced blocks, fills, smears) and drops subtle compression haze. Measured on
+    premultiplied 8-bit display values, so EXR and PNG renders give the same matte."""
+    o = np.asarray(to_display8(out), np.float32)
+    if plate is not None:
+        clean = np.asarray(to_display8(composite_on(img, plate)), np.float32)
+        bg = np.asarray(to_display8(plate), np.float32)
+    else:
+        py, px = pad
+        clean = np.pad(np.asarray(to_display8(img), np.float32), ((py, py), (px, px), (0, 0)))
+        bg = np.zeros_like(clean)
+    if clean.shape != o.shape:
+        raise ValueError(f"glitch pass: output is {o.shape[1]}x{o.shape[0]}, the clean frame "
+                         f"{clean.shape[1]}x{clean.shape[0]} (--trim can't be combined with it)")
+
+    def pm(x):
+        return np.concatenate([x[..., :3] * (x[..., 3:] / 255.0), x[..., 3:]], -1)
+
+    O = pm(o)
+    d = np.minimum(np.abs(O - pm(clean)).max(-1), np.abs(O - pm(bg)).max(-1))
+    return np.clip((d - PASS_LO) / (PASS_HI - PASS_LO), 0.0, 1.0).astype(np.float32)
+
+
+def save_pass(m, dst, io=None):
+    """Write a matte: 8-bit greyscale PNG/TIFF/WebP, or EXR with R=G=B=A=matte (so Fusion /
+    Nuke can use it as luminance or alpha)."""
+    io = {**IO_DEFAULTS, **(io or {})}
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.stem + ".tmp" + dst.suffix)
+    if dst.suffix.lower() != ".exr":
+        Image.fromarray((np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8), "L").save(tmp)
+    else:
+        OpenEXR = _openexr()
+        dt = np.float16 if io["exr_depth"] == "half" else np.float32
+        ch = np.ascontiguousarray(m.astype(dt))
+        comp = getattr(OpenEXR, EXR_COMPRESSIONS[io["exr_compression"]])
+        OpenEXR.File({"compression": comp, "type": OpenEXR.scanlineimage},
+                     {c: ch for c in "RGBA"}).write(str(tmp))
+    os.replace(tmp, dst)
+    return dst
+
+
 def _render(job):
     src, dst, frame, bbox, kw, ang, camd, io, fo, prev = job
     yaw, pitch, roll = ang if ang is not None else (None, None, None)
     img, raw = load_frame(src, io)
     fo = dict(fo)
+    pass_dst = fo.pop("pass_dst", None)
     plate_path, prev_plates = fo.pop("plate", None), fo.pop("prev_plates", None)
     prev_frames = fo.pop("prev_frames", None)
     H, W = (img.shape[:2] if isinstance(img, np.ndarray) else (img.height, img.width))
@@ -2815,6 +2871,8 @@ def _render(job):
                  history=SeqHistory(prev, io, plates=prev_plates, frames=prev_frames) if prev else None,
                  history_key=(str(src), None, str(plate_path) if plate_path else None), **{**kw, **fo})
     pad = (0, 0) if plate is not None else (int(H * kw["pad"]), int(W * kw["pad"]))
+    if pass_dst:
+        save_pass(glitch_pass(out, img, plate, pad), pass_dst, io)
     exact = raw is not None and not kw.get("trim") and plate is None
     return save_frame(out, dst, io, raw=raw if exact else None, src=img if exact else None, pad=pad)
 
@@ -2942,6 +3000,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="EXR output precision: 16-bit half (default) or 32-bit float")
     ge.add_argument("--exr-compression", choices=sorted(EXR_COMPRESSIONS), default="zip",
                     help="EXR compression (default zip, lossless; dwaa/dwab are lossy and small)")
+    ge.add_argument("--glitch-pass", nargs="?", const="", default=None, metavar="DIR",
+                    help="also write a glitch matte for every frame: white where the glitch made "
+                         "the pixel (blocks, smears, echoes, spill...), black where it is the clean "
+                         "subject or background, grey = changed a little. Use it to glow, grade or "
+                         "regrain only the glitch in the comp. Same file names, in DIR (default: a "
+                         "glitch_pass folder inside the output folder)")
     g3 = ap.add_argument_group("3D mode")
     g3.add_argument("--pose", type=Path,
                     help="file with 'frame, yaw[, pitch[, roll]]' rows in degrees (a header may name "
@@ -3249,6 +3313,21 @@ def plan_render(args, notes: list | None = None, scan_cache: dict | None = None,
                     prev_plates=tuple(str(plates[j]) for j in range(i - 1, max(-1, i - 1 - MAX_BACK), -1))
                     if kind != "file" else ())
                for i, fo in enumerate(fos)]
+    if getattr(args, "glitch_pass", None) is not None:
+        if args.trim:
+            raise PlanError("--glitch-pass can't be combined with --trim (the matte must match the "
+                            "frame's size)")
+        pdir = Path(args.glitch_pass) if args.glitch_pass else None
+        pdsts = [(pdir or Path(d_).parent / "glitch_pass") / Path(d_).name for _, d_, _ in items]
+        mains = {_ident(d_) for _, d_, _ in items}
+        protected = sources | ({_ident(q) for q in plist} if plates is not None else set())
+        for q in pdsts:
+            if _ident(q) in mains:
+                raise PlanError(f"--glitch-pass would overwrite the rendered frame {q}: give it a "
+                                f"folder other than the output folder")
+            if _ident(q) in protected:
+                raise PlanError(f"refusing to overwrite source material {q} with the glitch pass")
+        fos = [dict(fo, pass_dst=str(q)) for fo, q in zip(fos, pdsts)]
     work = [(s, d, fr, b, kw, g, cm, io, fo, pv)
             for (s, d, fr), b, g, cm, fo, pv in zip(items, boxes, angs, cams, fos, prevs)]
     if getattr(args, "range", None):

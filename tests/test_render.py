@@ -145,3 +145,75 @@ def _has_openexr():
         return True
     except ImportError:
         return False
+
+
+# ---------------------------------------------------------------- glitch pass (matte)
+def _pass(folder):
+    return sorted((Path(folder) / "glitch_pass").glob("*.*"))
+
+
+def test_glitch_pass_written_next_to_frames(frames, tmp_path):
+    out = render(frames, tmp_path / "gp", *TIME_FX, "--glitch-pass")
+    mats = _pass(tmp_path / "gp")
+    assert [m.name for m in mats] == [o.name for o in out]
+    for o, m in zip(out, mats):
+        a, mt = synth.load(o), synth.load(m)
+        assert mt.ndim == 2 and mt.shape == a.shape[:2]        # 8-bit greyscale, same size
+        assert mt.max() > 0, "a strong glitch must show up in the matte"
+        assert mt[a[..., 3] == 0].max() == 0, "transparent output pixels are never glitch"
+
+
+def test_glitch_pass_is_black_without_glitch(frames, tmp_path):
+    render(frames, tmp_path / "zero", "--skip", ",".join(glitch.EFFECT_ORDER), "--glitch-pass",
+           "--range", "0-2")
+    assert all(synth.load(m).max() == 0 for m in _pass(tmp_path / "zero"))
+
+
+def test_glitch_pass_marks_only_changed_pixels(frames, tmp_path):
+    out = render(frames, tmp_path / "gp", "-i", "0.8", "--glitch-pass")
+    for src, o, m in zip(sorted(frames.glob("*.png")), out, _pass(tmp_path / "gp")):
+        same = (_premul(synth.load(src)) == _premul(synth.load(o))).all(-1)
+        assert synth.load(m)[same].max() == 0, "an unchanged pixel must be black in the matte"
+
+
+def test_glitch_pass_hidden_frames_are_black(frames, tmp_path):
+    render(frames, tmp_path / "ap", "--appear", "3", "--trans-len", "0.04", "--glitch-pass")
+    mats = _pass(tmp_path / "ap")
+    assert all(synth.load(m).max() == 0 for m in mats[:3])
+
+
+def test_glitch_pass_partial_matches_full(frames, tmp_path):
+    render(frames, tmp_path / "full", *TIME_FX, "--glitch-pass")
+    render(frames, tmp_path / "part", *TIME_FX, "--glitch-pass", "--range", "4-8")
+    full = {m.name: m for m in _pass(tmp_path / "full")}
+    part = _pass(tmp_path / "part")
+    assert len(part) == 5 and all(synth.same_images(m, full[m.name]) for m in part)
+
+
+def test_glitch_pass_on_plate_leaves_the_clean_plate_black(frames, plate, tmp_path):
+    render(frames, tmp_path / "pl", "--plate", plate, "--spill", "0.05", "-i", "0.8", "--glitch-pass")
+    for m in _pass(tmp_path / "pl"):
+        assert synth.load(m)[:6, -6:].max() == 0             # far corner: untouched plate
+
+
+def test_glitch_pass_custom_folder_and_guards(frames, tmp_path):
+    render(frames, tmp_path / "o", "--glitch-pass", tmp_path / "mattes", "--range", "0-1")
+    assert len(list((tmp_path / "mattes").glob("*.png"))) == 2
+    for bad in ([str(tmp_path / "o2")], [str(frames)]):       # = the output folder / the input
+        with pytest.raises(SystemExit):
+            glitch.main([str(frames), "-o", str(tmp_path / "o2"), "--glitch-pass", *bad])
+    with pytest.raises(SystemExit):
+        glitch.main([str(frames / "f_0001.png"), "-o", str(tmp_path / "t.png"), "--trim",
+                     "--glitch-pass"])
+
+
+def test_glitch_pass_exr(frames, tmp_path):
+    if not _has_openexr():
+        skip_or_fail("EXR", "OpenEXR is not installed")
+    render(frames, tmp_path / "e", "--format", "exr", "-i", "0.8", "--glitch-pass", "--range", "3-3")
+    render(frames, tmp_path / "p", "-i", "0.8", "--glitch-pass", "--range", "3-3")
+    rgba, _ = glitch._exr_rgba(_pass(tmp_path / "e")[0])
+    r, a = rgba[..., 0], rgba[..., 3]
+    assert (r == a).all() and r.max() > 0
+    png = synth.load(_pass(tmp_path / "p")[0]) / 255.0
+    assert np.abs(r - png).max() < 2.5 / 255                  # same matte as the PNG render

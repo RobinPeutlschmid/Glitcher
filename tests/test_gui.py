@@ -125,3 +125,11 @@ def test_full_render_matches_cli(app, tmp_path):
     assert glitch.main(app.argv(with_output=False) + ["-o", str(ref), "-j", "1"]) == 0
     for f in sorted(out.glob("*.png")):
         assert synth.same_images(f, ref / f.name), f.name
+
+
+def test_glitch_pass_checkbox(app):
+    app.vars["glitch_pass"].set(True)
+    assert "--glitch-pass" in app.argv(with_output=True)
+    assert "--glitch-pass" not in app.argv(with_output=False)   # previews don't write mattes
+    app.vars["glitch_pass"].set(False)
+    assert "--glitch-pass" not in app.argv(with_output=True)

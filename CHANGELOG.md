@@ -3,10 +3,36 @@
 Version numbers: MAJOR.MINOR.PATCH. The version lives in one place, `__version__` in glitch.py;
 the GUI title, `--version` of every tool, saved presets and the portable build's zip name read it
 from there.
-## 1.3.1 — 2026-11-23
-### Fixed
-- Fixed issues with Mac and Linux builds
 
+## 1.4.0 — 2026-11-23
+
+### New
+- **Glitch pass**: a matte of where the glitch is, written next to every rendered frame
+  (`--glitch-pass`, or "Glitch pass (matte)" under Output format in the editor). Same file
+  names, in `glitch_pass/` inside the output folder or a folder you name (`--glitch-pass DIR`).
+  - White = the glitch made this pixel: displaced blocks, slices, smears, fills, RGB split,
+    echoes, held frames, datamosh, transitions, spill into the plate. Black = the clean subject,
+    the clean background (transparency or the plate), and hidden frames.
+  - Grey levels say how strongly a pixel changed (linear up to 64 levels of 255), so the comp
+    picks the threshold: a Levels / Threshold keeps just the hard glitches and drops subtle
+    compression haze.
+  - PNG renders: 8-bit greyscale PNG. EXR renders: EXR with R = G = B = A = matte, usable as
+    luminance or alpha in Fusion / Nuke. Both give the same matte.
+  - Frame-exact like the render: a `--range` re-render gives the same matte as a full one.
+  - Refuses to write into the output folder itself (it would replace the frames) or over input
+    or plate files; can't be combined with `--trim`.
+
+## 1.3.1 — 2026-11-23
+
+### Fixed
+- macOS portable app: pose estimation failed to load ("recursion is detected during loading of
+  cv2"): OpenCV's self-loader breaks inside a .app bundle. The portable app now leaves OpenCV out
+  (MediaPipe imports it only for drawing helpers Glitcher never uses) and gives MediaPipe a
+  placeholder module. This also makes the full build about half the size (Linux zip 272 → 137 MB).
+- When MediaPipe is installed but fails to load, the pose estimator now shows the real error
+  instead of claiming MediaPipe isn't there.
+- CI: the version check ran `glitch.py` on a Python without NumPy and crashed; it now reads the
+  version as text. Linux CI installs `libgles2`, which MediaPipe needs.
 
 ## 1.3.0 — 2026-11-23
 

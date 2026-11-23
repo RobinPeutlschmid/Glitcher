@@ -255,6 +255,7 @@ def preview_job(job, scale: float):
     Runs in a worker process. EXR frames are glitched in float like the full render."""
     src, dst, frame, bbox, kw, ang, camd, io, fo, prev = job
     fo = dict(fo)
+    fo.pop("pass_dst", None)                                # the matte is written by full renders only
     plate_path, prev_plates = fo.pop("plate", None), fo.pop("prev_plates", None)
     prev_frames = fo.pop("prev_frames", None)
     yaw, pitch, roll = ang if ang is not None else (None, None, None)
@@ -578,6 +579,10 @@ class App:
             cb = ttk.Combobox(o, textvariable=v, values=values, width=14, state="readonly")
             cb.grid(row=row, column=1, sticky="w", pady=1)
             cb.bind("<<ComboboxSelected>>", lambda _e: self._settings_changed())
+        v = self.vars["glitch_pass"] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(o, text="Glitch pass (matte) → output/glitch_pass/",
+                        variable=v, command=self._settings_changed
+                        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         a = self._section(left, "Presets & output", "presets", pady=(0, 0))
         ttk.Button(a, text="Save preset…  Ctrl+S", command=lambda: self.save_preset(ask=True)
@@ -2311,6 +2316,8 @@ class App:
                              ("exr_depth", "half"), ("exr_compression", "zip")):
             if s.get(key, default) != default:
                 a += ["--" + key.replace("_", "-"), s[key]]
+        if s.get("glitch_pass") and with_output:
+            a += ["--glitch-pass"]
         if s.get("input") and Path(s["input"]).is_file():
             a += ["-n", str(int(s.get("frames") or 1))]
         a += self._curve_args(with_output)
