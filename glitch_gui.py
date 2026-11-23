@@ -31,7 +31,8 @@ Design notes
   so picture and sound stay in sync even while frames are still rendering. MP3 needs the
   miniaudio package (pip install miniaudio) or ffmpeg; WAV needs nothing extra.
 * Every section folds (click its header; remembered), Ctrl+B hides the whole side panel.
-  Shortcuts: Ctrl+S save preset (then autosaves every 2 min), Ctrl+O load preset, Ctrl+B panel.
+  Shortcuts: Ctrl+S save preset (then autosaves every 2 min), Ctrl+O load preset, Ctrl+B panel,
+  Ctrl+Z undo, Ctrl+Y / Ctrl+Shift+Z redo.
 * Preview scale shrinks the input before glitching. Effects are laid out relative to the person,
   so the look is the same; only pixel-sized details (8 px JPEG blocks, 1 px streaks) differ
   slightly from the full-resolution render.
@@ -234,7 +235,10 @@ class AudioPlayer:
         self.t0, self.backend = None, None
 
 
-AUTOSAVE_MS = 120_000                # preset autosave interval, once a preset has been saved
+AUTOSAVE_MS = 120_000
+UNDO_SETTLE_MS = 400                  # edits closer together than this are one undo step
+UNDO_DEPTH = 200
+VIEW_KEYS = {"pscale", "compare", "bg", "audio_sync"}   # how you look at it, not what it renders                # preset autosave interval, once a preset has been saved
 BACKGROUNDS = {"dark": (34, 34, 34), "black": (0, 0, 0), "white": (255, 255, 255),
                "green": (0, 177, 64), "checker": None}
 CACHE_BYTES = 1_500_000_000          # preview cache budget (oldest frames are evicted beyond it)
@@ -346,6 +350,10 @@ class App:
         self._adrag = None
         self._awave_key = None
         self._audio_sync = None        # (monotonic t0, start index) while Play follows the audio
+        self._undo: list = []          # snapshots (JSON); _undo_i points at the current one
+        self._undo_i = -1
+        self._undo_id = None
+        self._restoring = False
         self.live_pool = ProcessPoolExecutor(1)
         self.play_pool = ProcessPoolExecutor(max(1, _cpus() - 1))
 
@@ -364,7 +372,11 @@ class App:
             self.vars["input"].set(initial)
             self._input_changed()
         root.protocol("WM_DELETE_WINDOW", self.close)
-        for keys, fn in ((("<Control-b>", "<Control-B>", "<Command-b>"), lambda: self.toggle_panel()),
+        self.root.after(600, self._undo_commit)             # the starting point is the first step
+        for keys, fn in ((("<Control-z>", "<Command-z>"), lambda: self.undo()),
+                         (("<Control-y>", "<Control-Y>", "<Control-Z>", "<Control-Shift-z>", "<Control-Shift-Z>",
+                           "<Command-Z>", "<Command-Shift-z>"), lambda: self.redo()),
+                         (("<Control-b>", "<Control-B>", "<Command-b>"), lambda: self.toggle_panel()),
                          (("<Control-s>", "<Control-S>", "<Command-s>"), lambda: self.save_preset()),
                          (("<Control-o>", "<Control-O>", "<Command-o>"), lambda: self.load_preset())):
             for seq in keys:                                   # Cmd+S / Cmd+O on macOS
@@ -408,6 +420,12 @@ class App:
         self.theme_btn.grid(row=0, column=4, padx=(8, 0))
         self.panel_btn = ttk.Button(top, text="◀ Panel", width=8, style="Ghost.TButton", command=self.toggle_panel)
         self.panel_btn.grid(row=1, column=4, padx=(8, 0))
+        self.undo_btn = ttk.Button(top, text="↶ Undo", width=8, style="Ghost.TButton", command=self.undo,
+                                   state="disabled")
+        self.undo_btn.grid(row=2, column=4, padx=(8, 0))
+        self.redo_btn = ttk.Button(top, text="↷ Redo", width=8, style="Ghost.TButton", command=self.redo,
+                                   state="disabled")
+        self.redo_btn.grid(row=3, column=4, padx=(8, 0))
         top.columnconfigure(1, weight=1)
 
         body = self.body = ttk.PanedWindow(r, orient="horizontal")
@@ -1734,6 +1752,7 @@ class App:
         self._draw_timeline()
 
     def _pose_hints_changed(self):
+        self._undo_mark()
         self._pose_save_hints()
         self._draw_timeline()
         self._pose_show_now()
@@ -1914,6 +1933,82 @@ class App:
         if self.tl_trans and abs(self._trans_len() - 1.0) > 1e-9:
             a += ["--trans-len", f"{self._trans_len():g}"]
         return a
+
+    # ----------------------------------------------------------------- undo / redo
+    def _snapshot(self) -> str:
+        s = {k: v for k, v in self.settings().items() if k not in VIEW_KEYS}
+        s["pose_hints"] = {ch: [list(h) for h in hs] for ch, hs in self.pose_hints.items()}
+        return json.dumps(s, sort_keys=True)
+
+    def _undo_mark(self):
+        """Something changed: record it once things settle (a slider drag = one step)."""
+        if getattr(self, "_restoring", True) or not hasattr(self, "undo_btn"):
+            return                                          # (still building the window)
+        if self._undo_id is not None:
+            self.root.after_cancel(self._undo_id)
+        self._undo_id = self.root.after(UNDO_SETTLE_MS, self._undo_commit)
+
+    def _undo_commit(self):
+        self._undo_id = None
+        try:
+            snap = self._snapshot()
+        except (tk.TclError, ValueError):
+            return
+        if self._undo_i >= 0 and self._undo[self._undo_i] == snap:
+            return
+        del self._undo[self._undo_i + 1:]                   # a new edit drops the redo branch
+        self._undo.append(snap)
+        if len(self._undo) > UNDO_DEPTH:
+            del self._undo[0]
+        self._undo_i = len(self._undo) - 1
+        self._undo_buttons()
+
+    def _undo_buttons(self):
+        self.undo_btn.configure(state="normal" if self._undo_i > 0 else "disabled")
+        self.redo_btn.configure(state="normal" if self._undo_i < len(self._undo) - 1 else "disabled")
+
+    @staticmethod
+    def _undo_what(a: str, b: str) -> str:
+        """Names of what differs between two snapshots, for the status bar."""
+        da, db = json.loads(a), json.loads(b)
+        names = {"timing": "timeline", "pose_hints": "pose hints"}
+        diff = [names.get(k, k.replace("_", " ")) for k in sorted(set(da) | set(db)) if da.get(k) != db.get(k)]
+        return ", ".join(diff[:4]) + (f" (+{len(diff) - 4} more)" if len(diff) > 4 else "") or "nothing"
+
+    def undo(self):
+        self._undo_step(-1)
+
+    def redo(self):
+        self._undo_step(+1)
+
+    def _undo_step(self, d: int):
+        if self._undo_id is not None:                       # an edit still settling counts first
+            self.root.after_cancel(self._undo_id)
+            self._undo_commit()
+        j = self._undo_i + d
+        if not 0 <= j < len(self._undo):
+            self.set_status("Nothing to " + ("undo" if d < 0 else "redo"), note=True)
+            return
+        what = self._undo_what(self._undo[self._undo_i], self._undo[j])
+        snap = json.loads(self._undo[j])
+        self._restoring = True
+        try:
+            hints = snap.pop("pose_hints", None)
+            self.apply_settings(snap)
+            if hints is not None:
+                self.pose_hints = {ch: sorted(tuple(h) for h in hints.get(ch, [])) for ch in POSE_CH}
+                self._pose_save_hints()
+                self._pose_schedule()
+            self._tl_act = (None, None)
+            self._draw_timeline()
+            self._audio_file_changed() if snap.get("audio", "") != (self.audio or {}).get("path", "") else None
+            self._settings_changed()
+        finally:
+            self._restoring = False
+        self._undo_i = j
+        self._undo_buttons()
+        self.set_status(("Undid: " if d < 0 else "Redid: ") + what
+                        + f"   (step {self._undo_i} of {len(self._undo) - 1})", note=True)
 
     # ----------------------------------------------------------------- sections
     def _section(self, parent, title, key, pady=(0, 6), side=None, padding=6):
@@ -2363,6 +2458,7 @@ class App:
         if self._debounce is not None:
             self.root.after_cancel(self._debounce)
         self._debounce = self.root.after(180, self._refresh)
+        self._undo_mark()
 
     def _refresh(self):
         self._debounce = None
@@ -2796,7 +2892,13 @@ class App:
             v.create_text(8 + w / 2, 104, text=f"confidence {now['confidence']:.2f}", anchor="n",
                           fill="#c0392b" if now["confidence"] < 0.25 else "#aaa", font=small)
 
-    def set_status(self, text: str, error: bool = False):
+    def set_status(self, text: str, error: bool = False, note: bool = False):
+        """note=True: a message that stays attached to the next few seconds of routine status
+        updates (e.g. 'Undid: seed' would otherwise vanish behind 'Rendering frame …')."""
+        if note:
+            self._note = (text, time.monotonic() + 4.0)
+        elif not error and getattr(self, "_note", None) and time.monotonic() < self._note[1]:
+            text = f"{text}   ·   {self._note[0]}"
         self.status.config(text=text, foreground=self.pal["err"] if error else self.pal["muted"])
 
     def _poll(self):

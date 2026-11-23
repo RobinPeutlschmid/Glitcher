@@ -1,0 +1,19 @@
+# Python bytecode caches (recreated on every run)
+__pycache__/
+*.py[cod]
+
+# build_portable.py / PyInstaller output (rebuilt by CI; hundreds of MB)
+build/
+dist/
+*.spec
+
+# a stray copy of the project folder (e.g. an unzipped release inside the repo)
+glitcher/
+
+# the MediaPipe pose model: ~30 MB, downloaded on demand (CI caches it)
+*.task
+
+# test runner and local environments
+.pytest_cache/
+.venv/
+venv/
