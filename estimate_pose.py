@@ -286,6 +286,35 @@ def resolve_model(path: str | None, variant: str) -> str:
     return str(cache)
 
 
+def self_check(model_path: str | None = None, variant: str = "heavy") -> int:
+    """--check: load MediaPipe and the model and run one detection on a blank image. Used by the
+    release builds to prove a packaged app can really estimate poses (a missing native library
+    or model only shows up when the detector is created). 0 = works, 3 = doesn't."""
+    if not _have_mediapipe():
+        print("pose check FAILED: " + NO_MEDIAPIPE, file=sys.stderr)
+        return 3
+    try:
+        import mediapipe as mp
+        from mediapipe.tasks import python as mpt
+        from mediapipe.tasks.python import vision
+        model = resolve_model(model_path, variant)
+        det = vision.PoseLandmarker.create_from_options(vision.PoseLandmarkerOptions(
+            base_options=mpt.BaseOptions(model_asset_path=model),
+            running_mode=vision.RunningMode.IMAGE, num_poses=1))
+        try:
+            img = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.full((64, 64, 3), 128, np.uint8))
+            res = det.detect(img)
+        finally:
+            det.close()
+        if res is None or not hasattr(res, "pose_landmarks"):
+            raise RuntimeError("the detector returned no result")
+    except Exception as ex:                               # noqa: BLE001 - report anything, exit 3
+        print(f"pose check FAILED: {type(ex).__name__}: {ex}", file=sys.stderr)
+        return 3
+    print(f"pose check OK: MediaPipe {getattr(mp, '__version__', '?')}, model {model}")
+    return 0
+
+
 def extract(files, model: str, fps: float, bg: int = 128, io=None, progress: bool = False):
     """-> (F, LM). F: per-frame landmark features, shape (N, len(FEAT)); row 'ok'=0 where no person
     was found. LM: all 33 MediaPipe landmarks per frame, (N, 33, 3) = x, y in full-frame pixels and
@@ -686,7 +715,10 @@ def main(argv=None) -> int:
     import glitch
     ap.add_argument("--version", action="version",
                     version=f"{getattr(glitch, 'APP_NAME', 'Glitcher')} {getattr(glitch, '__version__', '?')} (estimate_pose.py)")
-    ap.add_argument("input", help="folder of frames, quoted glob, or a single image")
+    ap.add_argument("input", nargs="?", help="folder of frames, quoted glob, or a single image")
+    ap.add_argument("--check", action="store_true",
+                    help="only test that pose estimation works here (MediaPipe loads, the model is found "
+                         "and runs on a blank image); exit code 0 = works, 3 = doesn't")
     ap.add_argument("-o", "--output", type=Path, default=Path("pose.csv"))
     ap.add_argument("--fps", type=float, default=25.0, help="frame rate (default 25, as glitch.py)")
     ap.add_argument("--offset", type=int, default=0, help="add to every frame index (match glitch.py)")
@@ -723,6 +755,10 @@ def main(argv=None) -> int:
     ap.add_argument("--cache", type=Path,
                     help="landmark cache (.npz); reused if it matches, so re-solving with new hints is instant")
     args = ap.parse_args(argv)
+    if args.check:
+        return self_check(args.model, args.variant)
+    if not args.input:
+        ap.error("the input (folder of frames, glob or image) is required")
     if not args.fps > 0:
         ap.error("--fps must be > 0")
     if args.cache and args.cache.suffix.lower() != ".npz":

@@ -10,12 +10,13 @@ estimate_pose.py, using the Python that already runs the GUI:
     python build_portable.py --no-pose    # without MediaPipe: much smaller, Pose tab can't estimate
     python build_portable.py --onefile    # one file instead of a folder (starts slower)
 
-Result: dist/Glitcher/ (or Glitcher.app on macOS) plus a .zip named with the version, e.g.
-Glitcher-1.2.0-windows.zip. Copy or unzip that anywhere and start Glitcher. The same program also works as the command-line
-tools:
+Result: dist/Glitcher/ (or Glitcher.app on macOS) plus a .zip named with the version, system
+and CPU, e.g. Glitcher-1.3.0-windows-x64.zip ("-nopose" is added for --no-pose builds). Copy or
+unzip that anywhere and start Glitcher. The same program also works as the command-line tools:
 
     Glitcher --glitch frames/ -o out/ ...        (same options as glitch.py)
     Glitcher --estimate-pose frames/ -o pose.csv (same options as estimate_pose.py)
+    Glitcher --estimate-pose --check             (exit code 0 = pose estimation works)
 
 The pose model: put pose_landmarker_heavy.task (or full / lite) next to this script, or have
 it in ~/.cache/estimate_pose/ from an earlier run, and it is bundled. Without it the app
@@ -24,6 +25,7 @@ the app.
 """
 import argparse
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -31,6 +33,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 NAME = "Glitcher"
+
+
+def arch() -> str:
+    """CPU architecture for the zip name: x64 or arm64 (what the built app runs on)."""
+    m = platform.machine().lower()
+    return {"amd64": "x64", "x86_64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(m, m or "unknown")
 
 
 def main() -> int:
@@ -100,7 +108,9 @@ def main() -> int:
                            (f"{NAME}.exe" if args.onefile and os.name == "nt" else NAME))
     print(f"\nbuilt: {out}")
     if not args.no_zip and out.exists():
-        tag = {"win32": "windows", "darwin": "macos"}.get(sys.platform, "linux")
+        tag = {"win32": "windows", "darwin": "macos"}.get(sys.platform, "linux") + "-" + arch()
+        if args.no_pose:
+            tag += "-nopose"
         sys.path.insert(0, str(HERE))
         import glitch
         version = glitch.__version__

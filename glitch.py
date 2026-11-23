@@ -2191,7 +2191,7 @@ def load_audio(path):
                 raise ValueError(f"{p.name}: reading {p.suffix or 'this'} audio needs the miniaudio "
                                  f"package (pip install miniaudio) or ffmpeg; WAV works without either")
             r = subprocess.run([ff, "-v", "error", "-i", str(p), "-f", "s16le", "-ac", "1",
-                                "-ar", str(AUDIO_SR), "-"], capture_output=True)
+                                "-ar", str(AUDIO_SR), "-"], capture_output=True, stdin=subprocess.DEVNULL)
             if r.returncode != 0:
                 raise ValueError(f"{p.name}: ffmpeg could not decode it: {r.stderr.decode(errors='replace')[-200:]}")
             x, sr = np.frombuffer(r.stdout, np.int16).astype(np.float32) / 32768, AUDIO_SR

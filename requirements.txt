@@ -1,0 +1,10 @@
+# Glitcher runtime. Install with:  python -m pip install -r requirements.txt
+numpy>=1.24
+pillow>=10.0
+# optional - MP3 audio and in-app playback (WAV works without it)
+miniaudio>=1.59
+# optional - EXR input/output (PNG works without it)
+OpenEXR>=3.2
+# optional - pose estimation (Pose tab, --only/--protect landmarks). MediaPipe has no wheel for
+# Intel Macs, so it is skipped there; everything else works.
+mediapipe>=0.10.14; sys_platform != "darwin" or platform_machine == "arm64"

@@ -201,8 +201,8 @@ class AudioPlayer:
         for cmd in (["afplay"], ["paplay"], ["aplay", "-q"], ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]):
             exe = shutil.which(cmd[0])
             if exe:
-                self.proc = subprocess.Popen([exe, *cmd[1:], str(f)], stdout=subprocess.DEVNULL,
-                                             stderr=subprocess.DEVNULL)
+                self.proc = subprocess.Popen([exe, *cmd[1:], str(f)], stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 self.backend = cmd[0]
                 return ""
         return "no audio player found (pip install miniaudio)"
@@ -1844,7 +1844,8 @@ class App:
         self._pose_job = (pose, tmp, self._pose_state(), resolve)
         self._pose_cancelled = False
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True,
                                     bufsize=1, encoding="utf-8", errors="replace",
                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as ex:
@@ -3000,6 +3001,11 @@ class App:
 def main():
     import multiprocessing
     multiprocessing.freeze_support()          # packaged app: worker processes start here, not a new GUI
+    # A windowed Windows build started without console handles has sys.stdout / sys.stderr = None;
+    # the command-line modes below print progress, so give them a sink instead of crashing.
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
     # a packaged app has no separate Python: it doubles as the estimator and the glitch CLI
     if len(sys.argv) > 1 and sys.argv[1] == "--estimate-pose":
         import estimate_pose
@@ -3009,9 +3015,36 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
         print(f"{glitch.APP_NAME} {glitch.__version__}")
         raise SystemExit(0)
+    if len(sys.argv) > 2 and sys.argv[1] == "--self-test":
+        raise SystemExit(self_test(sys.argv[2]))
     root = tk.Tk()
     App(root, sys.argv[1] if len(sys.argv) > 1 else None)
     root.mainloop()
+
+
+def self_test(inp: str, timeout: float = 120.0) -> int:
+    """--self-test FRAMES: open the editor on FRAMES, wait for the first preview, close.
+    Exit code 0 = the GUI, its preview workers and the renderer all run in this build (used to
+    check the packaged app; your preferences file is not touched)."""
+    global PREFS_FILE
+    PREFS_FILE = Path(tempfile.mkdtemp(prefix="glitcher_selftest_")) / "prefs.json"
+    try:
+        root = tk.Tk()
+        app = App(root, inp)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            root.update()
+            if app.plan is not None and app.current_img is not None:
+                app.close()
+                print(f"self-test OK: first preview in {time.time() - t0:.1f} s")
+                return 0
+            time.sleep(0.02)
+        msg = app.status.cget("text")
+        app.close()
+        print(f"self-test FAILED: no preview after {timeout:.0f} s ({msg})", file=sys.stderr)
+        return 1
+    finally:
+        shutil.rmtree(PREFS_FILE.parent, ignore_errors=True)
 
 
 if __name__ == "__main__":

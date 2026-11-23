@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.spec
+# the pose model is downloaded (CI caches it), not committed: ~30 MB
+*.task
+# local stuff
+.venv/
+*.npz
+pose*.csv
