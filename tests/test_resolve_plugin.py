@@ -290,3 +290,18 @@ def test_panel_reports_problems(tmp_path, monkeypatch):
     fu = R.Fusion()
     G.Panel(res, fu, R.Bmd())
     assert "playhead" in fu.UIManager.widgets["Status"].Text      # a message, not a crash
+
+
+def test_install_never_blocks_on_a_dialog(tmp_path, monkeypatch):
+    """--install-resolve may only show a message box when there is no console at all; with
+    captured output (scripts, CI) a dialog nobody can click would hang forever."""
+    monkeypatch.setattr(glitch_gui, "RESOLVE_CONFIG", tmp_path / "cfg.json")
+    shown = []
+    monkeypatch.setattr(glitch_gui.messagebox, "showinfo", lambda *a, **k: shown.append(a))
+    monkeypatch.setattr(glitch_gui.messagebox, "showerror", lambda *a, **k: shown.append(a))
+    monkeypatch.setattr(glitch_gui, "_NO_CONSOLE", False)
+    for frozen, plat in ((True, "win32"), (False, "win32"), (True, "darwin")):
+        monkeypatch.setattr(glitch_gui.sys, "frozen", frozen, raising=False)
+        monkeypatch.setattr(glitch_gui.sys, "platform", plat)
+        assert glitch_gui.install_resolve(str(tmp_path / "S"), quiet=False) == 0
+    assert shown == []

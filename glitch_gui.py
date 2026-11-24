@@ -3161,6 +3161,8 @@ def main():
     multiprocessing.freeze_support()          # packaged app: worker processes start here, not a new GUI
     # A windowed Windows build started without console handles has sys.stdout / sys.stderr = None;
     # the command-line modes below print progress, so give them a sink instead of crashing.
+    global _NO_CONSOLE
+    _NO_CONSOLE = sys.stdout is None
     for name in ("stdout", "stderr"):
         if getattr(sys, name) is None:
             setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
@@ -3200,6 +3202,7 @@ def main():
 
 # --------------------------------------------------------------------------- Resolve plugin install
 RESOLVE_CONFIG = Path.home() / ".glitcher_resolve.json"
+_NO_CONSOLE = False                     # set in main(): True when started without stdout
 
 
 def resolve_scripts_dir() -> Path:
@@ -3245,8 +3248,11 @@ def install_resolve(dest: str | None = None, quiet: bool = False) -> int:
         msg, ok = (f"Installed the Glitcher plugin for DaVinci Resolve:\n{target_dir / 'Glitcher.py'}\n\n"
                    f"Restart Resolve, then use Workspace > Scripts > Glitcher."), True
     print(msg, file=sys.stdout if ok else sys.stderr)
-    if not quiet and getattr(sys, "frozen", False) and sys.platform == "win32":
-        try:                                              # a windowed app has no console to print to
+    if not quiet and _NO_CONSOLE:
+        # started with nowhere to print (a double-clicked shortcut to the windowed app): say it
+        # in a window. Never when output is captured or there's a console: a dialog nobody can
+        # click would hang scripts and CI.
+        try:
             r = tk.Tk()
             r.withdraw()
             (messagebox.showinfo if ok else messagebox.showerror)("Glitcher", msg)
