@@ -14,6 +14,7 @@ that built it. Not a pytest file: CI runs it after the build.
 Exit code 0 = all passed.
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -85,6 +86,24 @@ def main() -> int:
 
     r = run([exe, "--self-test", frames], timeout=240)
     check(r.returncode == 0, "editor opens and renders its first preview (--self-test)")
+
+    # DaVinci Resolve: a job renders headless, and the plugin installs from the app
+    jd = work / "job"
+    jd.mkdir()
+    (jd / "preset.json").write_text(json.dumps({"seed": 5, "intensity": 0.7}))
+    (jd / "job.json").write_text(json.dumps({
+        "glitcher_job": 1, "input": str(frames), "range": [2, 5], "output": "out/v001", "plate": "",
+        "fps": 25, "format": "exr", "exr_space": "display", "preset": "preset.json"}))
+    r = run([exe, "--render-job", jd / "job.json", "-j", "2"])
+    out = jd / "out" / "v001"
+    check(r.returncode == 0 and len(list(out.glob("*.exr"))) == 4
+          and len(list((out / "glitch_pass").glob("*.exr"))) == 4, "--render-job (Resolve plugin)")
+    env = {**os.environ, "HOME": str(work), "USERPROFILE": str(work), "APPDATA": str(work)}
+    r = run([exe, "--install-resolve", work / "Scripts" / "Utility"], timeout=120, env=env)
+    cfg = work / ".glitcher_resolve.json"
+    ok = (r.returncode == 0 and (work / "Scripts" / "Utility" / "Glitcher.py").is_file()
+          and cfg.is_file() and json.loads(cfg.read_text())["glitcher"] == [str(exe)])
+    check(ok, "--install-resolve copies the plugin and records this app")
 
     if args.pose:
         env = {**os.environ, "HOME": str(work), "USERPROFILE": str(work)}   # hide ~/.cache models

@@ -39,6 +39,7 @@ Design notes
 """
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
@@ -297,6 +298,193 @@ def _checker(size, cell=16):
 
 
 # --------------------------------------------------------------------------- the app
+def preset_defaults() -> dict:
+    """Every setting a preset can hold, at the editor's defaults. Old or hand-written presets
+    are merged over this, so a missing key never breaks a render."""
+    d = {k: "" for k in PATH_KEYS}
+    d.update(seed=7, fps=25.0, jpeg_quality=0, frames=48, format="auto", exr_space="linear",
+             exr_alpha="premultiplied", exr_depth="half", exr_compression="zip", glitch_pass=False,
+             part_feather=1.0, audio_start=0.0, audio_end=0.0, audio_strength=0.8, audio_sens=0.5,
+             hit_len=0.5, trans_len=1.0)
+    for key, _l, _lo, _hi, _st, default, _f in GLOBALS:
+        d[key] = default
+    for fx in glitch.EFFECT_ORDER:
+        d[f"on_{fx}"], d[f"gain_{fx}"], d[f"target_{fx}"] = True, 1.0, "all"
+    for pt in glitch.PARTS:
+        d[f"only_{pt}"] = d[f"protect_{pt}"] = False
+    d["timing"] = {"keys": [], "hits": [], "extra": {}, "trans": []}
+    return d
+
+
+def parse_timing(d: dict):
+    """A preset's "timing" block -> (keys, hits, extra, trans), sorted and typed."""
+    d = d or {}
+    keys = sorted((float(f), float(v)) for f, v in d.get("keys", []))
+    hits = sorted((float(h[0]), float(h[1]), (float(h[2]) if len(h) > 2 and h[2] else None))
+                  for h in d.get("hits", []))
+    extra = {k: [(float(f), float(v)) for f, v in kv] for k, kv in d.get("extra", {}).items()}
+    trans = sorted((float(x[0]), str(x[1]), (float(x[2]) if len(x) > 2 and x[2] else None))
+                   for x in d.get("trans", []) if str(x[1]) in ("in", "out"))
+    return keys, hits, extra, trans
+
+
+def _flt(v, default):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def preset_argv(s: dict, with_output: bool = True, curve_tmp: Path | None = None) -> list[str]:
+    """Settings (the editor's, or a preset merged over preset_defaults()) -> glitch.py command
+    line. The editor, --render-job and the Resolve plugin all go through this, so a preset
+    renders the same everywhere. Keyframe curves are written to <output>_timing.csv (or to
+    curve_tmp for previews)."""
+    if not s.get("input"):
+        raise glitch.PlanError("no input chosen")
+    a = [s["input"]]
+    if with_output and s.get("output"):
+        a += ["-o", s["output"]]
+    a += ["-s", str(int(s["seed"] or 0)), "--fps", f"{float(s['fps'] or 25):g}"]
+    for key, _l, _lo, _hi, _st, _d, flag in GLOBALS:
+        a += [flag, f"{float(s[key]):g}"]
+    if s.get("jpeg_quality"):
+        a += ["--jpeg-quality", str(int(s["jpeg_quality"]))]
+    skip = [fx for fx in glitch.EFFECT_ORDER if not s[f"on_{fx}"]]
+    if skip:
+        a += ["--skip", ",".join(skip)]
+    gains = [f"{fx}={float(s[f'gain_{fx}']):g}" for fx in glitch.EFFECT_ORDER
+             if s[f"on_{fx}"] and abs(float(s[f"gain_{fx}"]) - 1.0) > 1e-9]
+    if gains:
+        a += ["--gain", ",".join(gains)]
+    if s.get("pose"):
+        a += ["--pose", s["pose"]]
+    if s.get("plate"):
+        a += ["--plate", s["plate"]]
+    if s.get("audio") and float(s.get("audio_strength") or 0) > 0:
+        a += ["--audio", s["audio"], "--audio-start", f"{float(s.get('audio_start') or 0):g}",
+              "--audio-strength", f"{float(s['audio_strength']):g}",
+              "--audio-sens", f"{float(s.get('audio_sens') or 0):g}"]
+        if float(s.get("audio_end") or 0) > 0:
+            a += ["--audio-end", f"{float(s['audio_end']):g}"]
+    for mode in ("only", "protect"):
+        parts = [pt for pt in glitch.PARTS if s.get(f"{mode}_{pt}")]
+        if parts:
+            a += ["--" + mode, ",".join(parts)]
+    for fx in glitch.EFFECT_ORDER:
+        tg = s.get(f"target_{fx}", "all")
+        if s[f"on_{fx}"] and tg and tg != "all":
+            a += ["--target", f"{fx}={tg}"]
+    if any(x in a for x in ("--only", "--protect", "--target")) and \
+            abs(float(s.get("part_feather") or 1.0) - 1.0) > 1e-9:
+        a += ["--part-feather", f"{float(s['part_feather']):g}"]
+    if s.get("format", "auto") != "auto":
+        a += ["--format", s["format"]]
+    for key, default in (("exr_space", "linear"), ("exr_alpha", "premultiplied"),
+                         ("exr_depth", "half"), ("exr_compression", "zip")):
+        if s.get(key, default) != default:
+            a += ["--" + key.replace("_", "-"), s[key]]
+    if s.get("glitch_pass") and with_output:
+        a += ["--glitch-pass"]
+    if s.get("input") and Path(s["input"]).is_file():
+        a += ["-n", str(int(s.get("frames") or 1))]
+    # timing: keyframes go to a CSV next to the output, hits and transitions on the command line
+    keys, hits, extra, trans = parse_timing(s.get("timing"))
+    hit_len = max(0.01, _flt(s.get("hit_len"), 0.5))
+    trans_len = max(0.05, _flt(s.get("trans_len"), 1.0))
+    if keys or extra:
+        out = (s.get("output") or "").strip() if with_output else ""
+        if out:
+            path = Path(out).with_name(Path(out).name + "_timing.csv")
+        else:
+            path = curve_tmp or Path(tempfile.mkdtemp(prefix="glitcher_")) / "curve.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        kk = dict(extra)
+        if keys:
+            kk["intensity"] = keys
+        glitch.Timing(kk, [], _flt(s.get("fps") or 25, 24.0)).to_csv(path)
+        a += ["--curve", str(path)]
+    if hits:
+        a += ["--hits", ",".join(f"{f:g}:{st:g}" + (f":{sec:g}" if sec else "") for f, st, sec in hits)]
+    if abs(hit_len - 0.5) > 1e-9:
+        a += ["--hit-len", f"{hit_len:g}"]
+    for kind, flag in (("in", "--appear"), ("out", "--vanish")):
+        ts = [x for x in trans if x[1] == kind]
+        if ts:
+            a += [flag, ",".join(f"{f:g}" + (f":{sec:g}" if sec else "") for f, _k, sec in ts)]
+    if trans and abs(trans_len - 1.0) > 1e-9:
+        a += ["--trans-len", f"{trans_len:g}"]
+    return a
+
+
+def load_preset_file(path) -> dict:
+    """A preset file merged over the defaults, with its paths made native for this OS."""
+    d = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(d, dict):
+        raise ValueError(f"{path}: not a preset (expected a JSON object)")
+    s = preset_defaults()
+    s.update({k: v for k, v in d.items() if v is not None})
+    for k in PATH_KEYS:
+        s[k] = native_path(s.get(k)) or ""
+    return s
+
+
+# --------------------------------------------------------------------------- jobs (Resolve)
+JOB_KEYS = ("input", "output", "plate")
+
+
+def read_job(path) -> dict:
+    """job.json written by the Resolve plugin: where the frames are, where the result goes, and
+    which preset holds the look. Paths may be relative to the job file."""
+    path = Path(path).resolve()
+    j = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(j, dict) or "input" not in j or "output" not in j:
+        raise ValueError(f"{path}: not a Glitcher job (needs 'input' and 'output')")
+
+    def p(v):
+        if not v:
+            return ""
+        q = Path(native_path(v))
+        return str(q if q.is_absolute() else (path.parent / q))
+    out = dict(j)
+    for k in (*JOB_KEYS, "preset"):
+        out[k] = p(j.get(k))
+    return out
+
+
+def job_settings(job: dict) -> dict:
+    """The look from the job's preset (or the defaults), with the job's paths and the things
+    Resolve needs forced: pad 0 (frames line up with the timeline), the glitch pass on."""
+    s = load_preset_file(job["preset"]) if job.get("preset") and Path(job["preset"]).is_file() \
+        else preset_defaults()
+    for k in JOB_KEYS:
+        s[k] = job.get(k, "")
+    if job.get("fps"):
+        s["fps"] = float(job["fps"])
+    s["pad"] = 0.0
+    s["glitch_pass"] = True
+    s["format"] = job.get("format") or s.get("format") or "exr"
+    if job.get("exr_space") in ("linear", "display"):
+        s["exr_space"] = job["exr_space"]
+    return s
+
+
+def render_job(path, jobs: int | None = None) -> int:
+    """--render-job JOB.json: render a Resolve job headless, exactly as the editor would."""
+    try:
+        job = read_job(path)
+        argv = preset_argv(job_settings(job), with_output=True)
+    except (OSError, ValueError, KeyError, glitch.PlanError) as ex:
+        print(f"error: {ex}", file=sys.stderr)
+        return 2
+    rg = job.get("range")
+    if rg:
+        argv += ["--range", f"{int(rg[0])}-{int(rg[1])}"]
+    if jobs:
+        argv += ["-j", str(int(jobs))]
+    return glitch.main(argv)
+
+
 class App:
     def __init__(self, root: tk.Tk, initial: str | None = None):
         self.root = root
@@ -594,6 +782,8 @@ class App:
         self.render_btn.grid(row=2, column=0, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
         self.progress = ttk.Progressbar(a, mode="determinate")
         self.progress.grid(row=3, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+        ttk.Button(a, text="Install DaVinci Resolve plugin", command=self.install_resolve_plugin
+                   ).grid(row=4, column=0, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
         a.columnconfigure(0, weight=1)
         a.columnconfigure(1, weight=1)
 
@@ -721,12 +911,7 @@ class App:
                 "trans": [list(x) for x in self.tl_trans]}
 
     def _set_timing_state(self, d: dict):
-        self.tl_keys = sorted((float(f), float(v)) for f, v in d.get("keys", []))
-        self.tl_hits = sorted((float(h[0]), float(h[1]), (float(h[2]) if len(h) > 2 and h[2] else None))
-                              for h in d.get("hits", []))
-        self.tl_extra = {k: [(float(f), float(v)) for f, v in kv] for k, kv in d.get("extra", {}).items()}
-        self.tl_trans = sorted((float(x[0]), str(x[1]), (float(x[2]) if len(x) > 2 and x[2] else None))
-                               for x in d.get("trans", []) if str(x[1]) in ("in", "out"))
+        self.tl_keys, self.tl_hits, self.tl_extra, self.tl_trans = parse_timing(d)
 
     def _timing_changed(self):
         self._draw_timeline()
@@ -1915,31 +2100,6 @@ class App:
         if self._pose_state() != state:                   # edited while it ran: solve again
             self._pose_schedule() if self.pvars["auto"].get() else None
 
-    def _curve_args(self, with_output: bool) -> list[str]:
-        """Write the keyframes where the command can find them; hits go on the command line."""
-        a = []
-        if self.tl_keys or self.tl_extra:
-            out = (self.vars["output"].get().strip() if with_output else "")
-            path = Path(out).with_name(Path(out).name + "_timing.csv") if out else self._tmp_curve
-            path.parent.mkdir(parents=True, exist_ok=True)
-            keys = dict(self.tl_extra)
-            if self.tl_keys:
-                keys["intensity"] = self.tl_keys
-            glitch.Timing(keys, [], self._timing().fps).to_csv(path)
-            a += ["--curve", str(path)]
-        if self.tl_hits:
-            a += ["--hits", ",".join(f"{f:g}:{st:g}" + (f":{sec:g}" if sec else "")
-                                     for f, st, sec in self.tl_hits)]
-        if abs(self._hit_len() - 0.5) > 1e-9:
-            a += ["--hit-len", f"{self._hit_len():g}"]
-        for kind, flag in (("in", "--appear"), ("out", "--vanish")):
-            ts = [x for x in self.tl_trans if x[1] == kind]
-            if ts:
-                a += [flag, ",".join(f"{f:g}" + (f":{sec:g}" if sec else "") for f, _k, sec in ts)]
-        if self.tl_trans and abs(self._trans_len() - 1.0) > 1e-9:
-            a += ["--trans-len", f"{self._trans_len():g}"]
-        return a
-
     # ----------------------------------------------------------------- undo / redo
     def _snapshot(self) -> str:
         s = {k: v for k, v in self.settings().items() if k not in VIEW_KEYS}
@@ -2271,57 +2431,7 @@ class App:
         self._missing_paths = missing
 
     def argv(self, with_output: bool = True) -> list[str]:
-        s = self.settings()
-        if not s.get("input"):
-            raise glitch.PlanError("no input chosen")
-        a = [s["input"]]
-        if with_output and s.get("output"):
-            a += ["-o", s["output"]]
-        a += ["-s", str(int(s["seed"] or 0)), "--fps", f"{float(s['fps'] or 25):g}"]
-        for key, _l, _lo, _hi, _st, _d, flag in GLOBALS:
-            a += [flag, f"{float(s[key]):g}"]
-        if s.get("jpeg_quality"):
-            a += ["--jpeg-quality", str(int(s["jpeg_quality"]))]
-        skip = [fx for fx in glitch.EFFECT_ORDER if not s[f"on_{fx}"]]
-        if skip:
-            a += ["--skip", ",".join(skip)]
-        gains = [f"{fx}={float(s[f'gain_{fx}']):g}" for fx in glitch.EFFECT_ORDER
-                 if s[f"on_{fx}"] and abs(float(s[f"gain_{fx}"]) - 1.0) > 1e-9]
-        if gains:
-            a += ["--gain", ",".join(gains)]
-        if s.get("pose"):
-            a += ["--pose", s["pose"]]
-        if s.get("plate"):
-            a += ["--plate", s["plate"]]
-        if s.get("audio") and float(s.get("audio_strength") or 0) > 0:
-            a += ["--audio", s["audio"], "--audio-start", f"{float(s.get('audio_start') or 0):g}",
-                  "--audio-strength", f"{float(s['audio_strength']):g}",
-                  "--audio-sens", f"{float(s.get('audio_sens') or 0):g}"]
-            if float(s.get("audio_end") or 0) > 0:
-                a += ["--audio-end", f"{float(s['audio_end']):g}"]
-        for mode in ("only", "protect"):
-            parts = [pt for pt in glitch.PARTS if s.get(f"{mode}_{pt}")]
-            if parts:
-                a += ["--" + mode, ",".join(parts)]
-        for fx in glitch.EFFECT_ORDER:
-            tg = s.get(f"target_{fx}", "all")
-            if s[f"on_{fx}"] and tg and tg != "all":
-                a += ["--target", f"{fx}={tg}"]
-        if any(x in a for x in ("--only", "--protect", "--target")) and \
-                abs(float(s.get("part_feather") or 1.0) - 1.0) > 1e-9:
-            a += ["--part-feather", f"{float(s['part_feather']):g}"]
-        if s.get("format", "auto") != "auto":
-            a += ["--format", s["format"]]
-        for key, default in (("exr_space", "linear"), ("exr_alpha", "premultiplied"),
-                             ("exr_depth", "half"), ("exr_compression", "zip")):
-            if s.get(key, default) != default:
-                a += ["--" + key.replace("_", "-"), s[key]]
-        if s.get("glitch_pass") and with_output:
-            a += ["--glitch-pass"]
-        if s.get("input") and Path(s["input"]).is_file():
-            a += ["-n", str(int(s.get("frames") or 1))]
-        a += self._curve_args(with_output)
-        return a
+        return preset_argv(self.settings(), with_output, self._tmp_curve)
 
     @staticmethod
     def _plan_from_argv(argv, scan_cache):
@@ -2655,8 +2765,12 @@ class App:
         if self.render_cancel is not None:           # button acts as Cancel while rendering
             self.render_cancel.set()
             return
+        self._job_save()
         try:
             argv = self.argv(with_output=True)
+            if getattr(self, "_job", None) is not None and self._job.get("range"):
+                rg = self._job["range"]
+                argv += ["--range", f"{int(rg[0])}-{int(rg[1])}"]   # only the frames Resolve uses
             if not self.vars["output"].get().strip():
                 raise glitch.PlanError("choose an output folder")
             args = glitch.build_parser().parse_args(argv)
@@ -2700,6 +2814,42 @@ class App:
                 ex.shutdown(wait=False, cancel_futures=True)
                 self.q.put(("render_done", done, len(work), time.time() - t0, True, f"error: {exc}"))
         threading.Thread(target=run, daemon=True).start()
+
+    # ----------------------------------------------------------------- Resolve jobs
+    def install_resolve_plugin(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            ok = install_resolve(quiet=True) == 0
+        (messagebox.showinfo if ok else messagebox.showerror)("DaVinci Resolve plugin", buf.getvalue().strip())
+
+    def open_job(self, path):
+        """Opened from the Resolve plugin (--job JOB.json): load the job's look, point input /
+        output / plate at the job's folders and save every change back to the job's preset, so
+        the plugin's Render uses exactly what you set up here."""
+        job = read_job(path)
+        s = job_settings(job)
+        self.apply_settings(s)
+        self._job = job
+        self.preset_path = Path(job["preset"]) if job.get("preset") else None
+        if self.preset_path is not None:
+            self.preset_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_preset(self.preset_path, self._preset_json())
+            if self._autosave_id is None:
+                self._autosave_id = self.root.after(AUTOSAVE_MS, self._autosave)
+        self.root.title(f"{TITLE} — {job.get('name') or Path(path).parent.name} (DaVinci Resolve)")
+        self._settings_changed()
+        self.set_status(f"Resolve job {job.get('name', '')}: changes are saved to the job's preset; "
+                        f"render here or with Render in the Resolve panel.")
+
+    def _job_save(self):
+        """In a Resolve job, keep the preset current (the panel renders from it)."""
+        if getattr(self, "_job", None) is not None and self.preset_path is not None:
+            try:
+                self._write_preset(self.preset_path, self._preset_json())
+            except OSError as ex:
+                self.set_status(f"⚠ could not save the job preset: {ex}", error=True)
 
     # ----------------------------------------------------------------- presets / CLI
     def _preset_json(self) -> str:
@@ -2983,6 +3133,7 @@ class App:
         self.root.after(30, self._poll)
 
     def close(self):
+        self._job_save()
         if self._autosave_id is not None:
             self.root.after_cancel(self._autosave_id)
         self._autosave(final=True)                             # keep the last changes, if saved before
@@ -3024,9 +3175,85 @@ def main():
         raise SystemExit(0)
     if len(sys.argv) > 2 and sys.argv[1] == "--self-test":
         raise SystemExit(self_test(sys.argv[2]))
+    if len(sys.argv) > 2 and sys.argv[1] == "--render-job":
+        jobs = None
+        if "-j" in sys.argv[3:]:
+            jobs = int(sys.argv[sys.argv.index("-j") + 1])
+        raise SystemExit(render_job(sys.argv[2], jobs))
+    if len(sys.argv) > 1 and sys.argv[1] == "--install-resolve":
+        raise SystemExit(install_resolve(sys.argv[2] if len(sys.argv) > 2 else None))
+    ap = argparse.ArgumentParser(prog="Glitcher", description="Glitcher editor. Other modes: "
+                                 "--glitch ARGS (renderer CLI), --estimate-pose ARGS, --render-job "
+                                 "JOB.json, --install-resolve [SCRIPTS_DIR], --version")
+    ap.add_argument("input", nargs="?", help="frames to open")
+    ap.add_argument("--job", help="open a DaVinci Resolve job (job.json written by the plugin)")
+    args, _unknown = ap.parse_known_args()                 # macOS may add its own arguments
     root = tk.Tk()
-    App(root, sys.argv[1] if len(sys.argv) > 1 else None)
+    app = App(root, args.input)
+    if args.job:
+        try:
+            app.open_job(args.job)
+        except (OSError, ValueError) as ex:
+            messagebox.showerror("Cannot open the Resolve job", f"{args.job}\n\n{ex}")
     root.mainloop()
+
+
+# --------------------------------------------------------------------------- Resolve plugin install
+RESOLVE_CONFIG = Path.home() / ".glitcher_resolve.json"
+
+
+def resolve_scripts_dir() -> Path:
+    """Per-user folder DaVinci Resolve scans for Workspace > Scripts (Utility = every page)."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+        return base / "Blackmagic Design" / "DaVinci Resolve" / "Support" / "Fusion" / "Scripts" / "Utility"
+    if sys.platform == "darwin":
+        return (Path.home() / "Library" / "Application Support" / "Blackmagic Design" / "DaVinci Resolve"
+                / "Fusion" / "Scripts" / "Utility")
+    return Path.home() / ".local" / "share" / "DaVinciResolve" / "Fusion" / "Scripts" / "Utility"
+
+
+def glitcher_command() -> list[str]:
+    """How other programs start this Glitcher: the packaged app, or Python + this file."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, str(Path(__file__).resolve())]
+
+
+def install_resolve(dest: str | None = None, quiet: bool = False) -> int:
+    """--install-resolve: put the Glitcher script into Resolve's Workspace > Scripts menu and
+    remember where this Glitcher is, so the script can start it."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    src = base / "resolve" / "Glitcher.py"
+    target_dir = Path(dest) if dest else resolve_scripts_dir()
+    try:
+        if not src.is_file():
+            raise OSError(f"the plugin script is missing from this Glitcher ({src})")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target_dir / "Glitcher.py")
+        cfg = {}
+        if RESOLVE_CONFIG.is_file():
+            try:
+                cfg = json.loads(RESOLVE_CONFIG.read_text(encoding="utf-8")) or {}
+            except (OSError, ValueError):
+                cfg = {}
+        cfg.update(glitcher=glitcher_command(), version=glitch.__version__)
+        RESOLVE_CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except OSError as ex:
+        msg, ok = f"Could not install the DaVinci Resolve plugin:\n{ex}", False
+    else:
+        msg, ok = (f"Installed the Glitcher plugin for DaVinci Resolve:\n{target_dir / 'Glitcher.py'}\n\n"
+                   f"Restart Resolve, then use Workspace > Scripts > Glitcher."), True
+    print(msg, file=sys.stdout if ok else sys.stderr)
+    if not quiet and getattr(sys, "frozen", False) and sys.platform == "win32":
+        try:                                              # a windowed app has no console to print to
+            r = tk.Tk()
+            r.withdraw()
+            (messagebox.showinfo if ok else messagebox.showerror)("Glitcher", msg)
+            r.destroy()
+        except tk.TclError:
+            pass
+    return 0 if ok else 1
 
 
 def self_test(inp: str, timeout: float = 120.0) -> int:

@@ -133,3 +133,47 @@ def test_glitch_pass_checkbox(app):
     assert "--glitch-pass" not in app.argv(with_output=False)   # previews don't write mattes
     app.vars["glitch_pass"].set(False)
     assert "--glitch-pass" not in app.argv(with_output=True)
+
+
+def test_open_resolve_job(app, frames, tmp_path):
+    """--job from the Resolve plugin: the job's look and paths load, Resolve's needs are forced
+    (pad 0, EXR, glitch pass), changes are saved to the job's preset, and a render in the editor
+    gives exactly what the plugin's headless --render-job gives."""
+    import glitch_gui as GG
+    jd = tmp_path / "job"
+    jd.mkdir()
+    (jd / "preset.json").write_text(json.dumps({"seed": 99, "intensity": 0.66, "pad": 0.2}))
+    job = {"glitcher_job": 1, "name": "hero (V2)", "input": str(frames), "range": [2, 5],
+           "output": "out/v001", "plate": "", "fps": 25, "format": "exr", "exr_space": "display",
+           "preset": "preset.json", "frames": [f"f_{i:04d}.exr" for i in range(3, 7)]}
+    (jd / "job.json").write_text(json.dumps(job))
+    app.open_job(jd / "job.json")
+    pump(app.root, 0.5)
+    v = app.vars
+    assert v["seed"].get() == 99 and v["intensity"].get() == pytest.approx(0.66)
+    assert v["pad"].get() == 0 and v["glitch_pass"].get() and v["format"].get() == "exr"
+    assert v["exr_space"].get() == "display" and Path(v["output"].get()) == jd / "out" / "v001"
+    assert "DaVinci Resolve" in app.root.title()
+    saved = json.loads((jd / "preset.json").read_text())
+    assert saved["seed"] == 99 and saved["glitcher_version"] == glitch.__version__
+    app.render_all()
+    out = jd / "out" / "v001"
+    assert pump(app.root, 300, lambda: app.render_cancel is None and len(list(out.glob("*.exr"))) == 4)
+    assert sorted(p.name for p in out.glob("*.exr")) == job["frames"]       # only Resolve's range
+    assert len(list((out / "glitch_pass").glob("*.exr"))) == 4
+    job2 = dict(job, output=str(tmp_path / "headless"))
+    (jd / "job2.json").write_text(json.dumps(job2))
+    assert GG.render_job(jd / "job2.json", jobs=1) == 0
+    for name in job["frames"]:
+        a, _ = glitch.load_frame(out / name, {"exr_space": "display"})
+        b, _ = glitch.load_frame(tmp_path / "headless" / name, {"exr_space": "display"})
+        assert np.array_equal(np.asarray(a), np.asarray(b)), name
+
+
+def test_preset_defaults_cover_every_setting(app):
+    """A preset missing keys renders with the editor's defaults: the defaults must know every
+    setting the editor has (else an old preset could break --render-job)."""
+    import glitch_gui as GG
+    d = GG.preset_defaults()
+    keys = set(app.settings()) - GG.VIEW_KEYS
+    assert keys <= set(d), sorted(keys - set(d))

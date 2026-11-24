@@ -1,7 +1,7 @@
 # Glitcher
 
-[![build](https://github.com/YOUR-NAME/glitcher/actions/workflows/build.yml/badge.svg)](https://github.com/YOUR-NAME/glitcher/actions/workflows/build.yml)
-[![latest release](https://img.shields.io/github/v/release/YOUR-NAME/glitcher)](https://github.com/YOUR-NAME/glitcher/releases/latest)
+[![build](https://github.com/RobinPeutlschmid/Glitcher/actions/workflows/build.yml/badge.svg)](https://github.com/RobinPeutlschmid/Glitcher/actions/workflows/build.yml)
+[![latest release](https://img.shields.io/github/v/release/RobinPeutlschmid/Glitcher)](https://github.com/RobinPeutlschmid/Glitcher/releases/latest)
 
 **"Digital hallucination" glitch for VFX: transparent cut-outs and image sequences in, temporally
 coherent, re-renderable glitch out.**
@@ -35,6 +35,8 @@ the subject's motion or to a soundtrack.
 - **Background plate.** Composite over the clean plate and let the glitch spill into it.
 - **Glitch pass.** A matte of where the glitch is, rendered alongside every frame, so the
   comp can glow, grade or regrain just the glitch.
+- **DaVinci Resolve plugin.** Send the clip under the playhead to Glitcher. The glitch, its
+  pass and a ready Fusion comp come back.
 - **Editor (GUI).**
   - Live preview, playback and a timeline.
   - A Pose tab with hint keyframes and an Audio tab.
@@ -88,6 +90,46 @@ missing when you use a feature that needs it:
 | `OpenEXR` | EXR input and output |
 | `mediapipe` | pose estimation (Pose tab, body-part landmarks) |
 
+## DaVinci Resolve plugin
+
+Glitch a clip without leaving Resolve (Resolve **Studio**: since Resolve 21.1, Python scripts
+need Studio). You also need Python 3 installed on the machine, which Resolve uses to run the
+plugin script; Glitcher itself can be the downloaded app.
+
+**Install:** in the Glitcher editor, open *Presets & output* and click **Install DaVinci Resolve
+plugin** (or run `Glitcher --install-resolve`). Restart Resolve.
+
+**Use:** put the playhead over the clip, then **Workspace > Scripts > Glitcher**.
+
+| Panel | What it does |
+|---|---|
+| Source | **Auto**: the clip's own RGBA image sequence if it has one, else the clip rendered from the timeline with its alpha (a key, Magic Mask or Fusion comp is then included). You can force either. |
+| Clean plate | Also render the tracks *below* the clip as a plate: the glitch spills into the real background and comes back as the full picture. |
+| Seed / Intensity | Saved in the clip's preset, the same one the editor uses. |
+| Open in Glitcher editor | The full editor on this clip; every change is saved to the clip's preset. |
+| Render | Renders a new version with Glitcher in the background, then imports it. |
+| Import latest | Imports the newest complete version (e.g. one rendered in the editor). |
+
+After import:
+- the glitch is on a new **Glitcher** track above the clip, and the original is disabled;
+- the glitch and its pass are in the **Glitcher** bin;
+- the glitch clip's Fusion comp is ready:
+
+```
+MediaIn (glitch) ──> GlitchGlow ──> GlitchGrade ──> MediaOut
+                        ▲ Glow Mask       ▲ Effect Mask
+GlitchPass (Loader) ──> PassMatte ────────┘
+```
+
+Raise *Low* on PassMatte to keep only the hard glitches. GlitchGlow makes light come from the
+glitch only, and the halo can still spread beyond it. GlitchGrade colours the glitch only.
+
+Each new version disables the previous one and copies its comp, tweaks included.
+
+Each clip's work lives in a job folder under `Documents/Glitcher Resolve/<project>/`, holding
+`job.json`, `preset.json`, the versions `out/v001`, `v002`, … and the logs. To put it on
+another drive, set `"cache"` in `~/.glitcher_resolve.json`.
+
 ## Command line
 
 ```bash
@@ -122,6 +164,7 @@ estimator. `estimate_pose.py --check` tests whether pose estimation works on thi
 | `glitch_gui.py` | the editor |
 | `estimate_pose.py` | yaw / pitch / roll and body landmarks from footage (MediaPipe) |
 | `build_portable.py` | packages everything as an app that needs no Python |
+| `resolve/Glitcher.py` | the DaVinci Resolve plugin (installed into Resolve by the editor) |
 | `tests/` | pytest suite; makes its own synthetic footage and audio |
 | `ci/release_notes.py` | release helper used by CI |
 | `.github/workflows/build.yml` | tests, builds and releases on GitHub Actions |

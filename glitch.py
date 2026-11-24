@@ -190,7 +190,7 @@ from __future__ import annotations
 import argparse
 import copy
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 APP_NAME = "Glitcher"
 import glob as _glob
 import json

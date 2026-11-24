@@ -4,6 +4,40 @@ Version numbers: MAJOR.MINOR.PATCH. The version lives in one place, `__version__
 the GUI title, `--version` of every tool, saved presets and the portable build's zip name read it
 from there.
 
+## 1.5.0 — 2026-11-24
+
+### New
+- **DaVinci Resolve plugin** (Resolve Studio): Workspace > Scripts > Glitcher. A round trip for
+  the clip under the playhead:
+  - **Source:** the clip's own RGBA image sequence (only the frames the timeline uses), or the
+    clip rendered from the timeline with its alpha, so a key, Magic Mask or Fusion comp made
+    in Resolve is included. "Auto" picks for you and says why.
+  - **Clean plate (optional):** the tracks below the clip are rendered as the plate, so the
+    glitch spills into the real background.
+  - **Render** headless from the panel (seed, intensity), or **Open in Glitcher editor** with
+    the clip loaded; both use the same per-clip preset, so what you set in the editor is what
+    the panel renders.
+  - **Import:** the glitch and its glitch pass go into a "Glitcher" bin, the glitch onto a new
+    track above the clip (same position; same framing for media files), the original is
+    disabled. Its Fusion comp is wired from standard nodes: the pass drives GlitchGlow (through
+    the Glow Mask input, so light comes from the glitch only but the halo spreads) and
+    GlitchGrade (colour of the glitch only).
+  - **Versions:** every render is a new version (v001, v002, ...); importing a new version
+    disables the previous one and carries its Fusion comp over, your tweaks included.
+  - **Colour:** EXR from Resolve is treated as display-encoded and files from other apps as
+    scene-linear (or choose); the result is written back the same way, so it matches the
+    clip it replaces.
+  - Resolve's Deliver settings are saved before and restored after its renders, and track
+    enables are put back.
+- Editor button **Install DaVinci Resolve plugin** (or `Glitcher --install-resolve`): copies the
+  script into Resolve's Scripts folder and records where this Glitcher is.
+- `Glitcher --render-job JOB.json` renders a plugin job headless; `Glitcher --job JOB.json`
+  opens it in the editor.
+
+### Changed
+- The editor's settings → command-line conversion is now one function shared by the editor,
+  `--render-job` and the plugin (checked identical on 120 random editor states).
+
 ## 1.4.0 — 2026-11-23
 
 ### New

@@ -89,6 +89,10 @@ def main() -> int:
             return 2
 
     sep = os.pathsep                          # --add-data separator: ';' on Windows, ':' elsewhere
+    plugin = HERE / "resolve" / "Glitcher.py"
+    if not plugin.is_file():
+        print(f"error: {plugin} is missing (the DaVinci Resolve plugin)", file=sys.stderr)
+        return 2
     cmd = [sys.executable, "-m", "PyInstaller", str(HERE / "glitch_gui.py"),
            "--name", NAME, "--noconfirm", "--windowed",
            "--onefile" if args.onefile else "--onedir",
@@ -96,7 +100,8 @@ def main() -> int:
            "--hidden-import", "estimate_pose",
            "--hidden-import", "PIL._tkinter_finder",   # Pillow <-> Tk bridge, missed otherwise
            "--distpath", str(HERE / "dist"), "--workpath", str(HERE / "build"),
-           "--specpath", str(HERE / "build")]
+           "--specpath", str(HERE / "build"),
+           "--add-data", f"{plugin}{sep}resolve"]      # Glitcher --install-resolve copies it
     if args.no_pose:
         cmd += ["--exclude-module", "mediapipe"]
     else:
