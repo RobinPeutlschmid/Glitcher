@@ -56,6 +56,7 @@ class MediaPool:
         self.root = Folder("Master")
         self.current = self.root
         self.timeline = timeline
+        self.timelines = [timeline]
         self.imports = []
 
     def GetRootFolder(self):
@@ -73,7 +74,41 @@ class MediaPool:
         parent.subs.append(f)
         return f
 
+    pattern_gives_still = False         # model a Resolve whose pattern import makes one still
+    whole_clip_gives_one = False        # model a Resolve that needs start / end frames
+
+    def CreateEmptyTimeline(self, name):
+        tl = Timeline(1, name)
+        self.timelines.append(tl)
+        return tl
+
+    def DeleteTimelines(self, tls):
+        for t in tls:
+            if t in self.timelines:
+                self.timelines.remove(t)
+        return True
+
+    def DeleteFolders(self, folders):
+        for f in folders:
+            if f in self.root.subs:
+                self.root.subs.remove(f)
+        return True
+
+    def DeleteClips(self, clips):
+        for c in clips:
+            for f in [self.root, *self.root.subs]:
+                if c in f.clips:
+                    f.clips.remove(c)
+        return True
+
     def ImportMedia(self, infos):
+        if infos and all(isinstance(x, str) for x in infos):      # a list of files: one sequence
+            files = sorted(infos)
+            m = re.match(r"^(.*?)(\d+)(\.\w+)$", os.path.basename(files[0]))
+            digits = len(m.group(2))
+            pat = os.path.join(os.path.dirname(files[0]), m.group(1) + "%0" + str(digits) + "d" + m.group(3))
+            nums = [int(re.match(r"^.*?(\d+)\.\w+$", os.path.basename(f)).group(1)) for f in files]
+            infos = [{"FilePath": pat, "StartIndex": nums[0], "EndIndex": nums[-1], "_list": True}]
         out = []
         for info in infos:
             pat, a, b = info["FilePath"], info["StartIndex"], info["EndIndex"]
@@ -84,19 +119,36 @@ class MediaPool:
             m = re.match(r"^(.*)%0(\d)d(\.\w+)$", os.path.basename(pat))
             shown = f"{m.group(1)}[{a:0{int(m.group(2))}d}-{b:0{int(m.group(2))}d}]{m.group(3)}"
             mpi = MediaPoolItem({"File Path": os.path.join(os.path.dirname(pat), shown),
-                                 "Frames": str(b - a + 1)})
+                                 "Frames": str(b - a + 1), "Start": str(a), "End": str(b)})
             mpi.files = files
+            mpi.first, mpi.last = a, b          # like Resolve: a sequence is numbered by its files
+            if self.pattern_gives_still and not info.get("_list"):
+                mpi.props["Frames"], mpi.last = "1", a
             self.current.clips.append(mpi)
             out.append(mpi)
         return lua(out)
 
+    zero_based = False                  # set True to model a Resolve that numbers clips from 0
+
     def AppendToTimeline(self, infos):
+        """Source frames are the clip's own numbers (a sequence's file numbers). Asking for
+        frames outside the clip gives what Resolve gave in the real test: a 1-frame clip."""
         out = []
         for info in infos:
-            n = info["endFrame"] - info["startFrame"] + 1
-            it = TimelineItem(info["mediaPoolItem"].name, info["recordFrame"], n, info["trackIndex"],
-                              info["mediaPoolItem"])
-            self.timeline.put(it)
+            m = info["mediaPoolItem"]
+            first = 0 if self.zero_based else getattr(m, "first", 0)
+            last = first + (getattr(m, "last", 0) - getattr(m, "first", 0)) if hasattr(m, "last") else 10 ** 9
+            if "startFrame" not in info:                    # the whole clip
+                n = 1 if self.whole_clip_gives_one else last - first + 1
+            else:
+                a, b = max(info["startFrame"], first), min(info["endFrame"], last)
+                n = b - a + 1 if b >= a else 1
+            tl = self.project.timeline if getattr(self, "project", None) else self.timeline
+            it = TimelineItem(m.name, info["recordFrame"], n, info["trackIndex"], m)
+            if "startFrame" in info:
+                it.left_offset = max(0, info["startFrame"] - first)
+            tl.playhead = "18:00:00:00"                     # Resolve may move it (your test)
+            tl.put(it)
             out.append(it)
         return lua(out)
 
@@ -152,7 +204,8 @@ class TimelineItem:
 
 
 class Timeline:
-    def __init__(self, n_tracks=2):
+    def __init__(self, n_tracks=2, name="Timeline 1", start_frame=86400):
+        self.name, self.start_frame = name, start_frame
         self.tracks = {t: [] for t in range(1, n_tracks + 1)}
         self.enabled = {t: True for t in self.tracks}
         self.names = {}
@@ -162,7 +215,8 @@ class Timeline:
     def put(self, it):
         self.tracks.setdefault(it.track, []).append(it)
 
-    def GetName(self): return "Timeline 1"
+    def GetName(self): return self.name
+    def GetStartFrame(self): return self.start_frame
     def GetSetting(self, k): return "25" if k == "timelineFrameRate" else ""
     def GetCurrentVideoItem(self): return self.current
     def GetTrackCount(self, kind): return len(self.tracks) if kind == "video" else 0
@@ -172,6 +226,21 @@ class Timeline:
     def SetTrackEnable(self, kind, t, b):
         self.enabled[t] = bool(b)
         self.enable_log.append((t, bool(b)))
+        return True
+
+    playhead = "01:00:00:00"
+
+    def GetCurrentTimecode(self): return self.playhead
+
+    def SetCurrentTimecode(self, tc):
+        self.playhead = tc
+        return True
+
+    def DeleteClips(self, items, ripple=False):
+        for it in items:
+            for t in self.tracks.values():
+                if it in t:
+                    t.remove(it)
         return True
 
     def AddTrack(self, kind, *_a):
@@ -191,12 +260,17 @@ class Project:
         - start of the timeline}; what Deliver would composite, per enabled track."""
         self.timeline, self.sources = timeline, sources
         self.media_pool = MediaPool(timeline)
+        self.media_pool.project = self
         self.settings, self.jobs, self.presets = {}, {}, {"Custom": {}}
         self.mode, self.fmt = 0, None
         self.restored = []
 
     def GetName(self): return "Test Project"
     def GetCurrentTimeline(self): return self.timeline
+
+    def SetCurrentTimeline(self, tl):
+        self.timeline = tl
+        return True
     def GetMediaPool(self): return self.media_pool
     def GetSetting(self, k): return "25"
     def GetRenderFormats(self): return {"QuickTime": "mov", "EXR": "exr"}
@@ -252,12 +326,24 @@ class Project:
     def _render(self, s):
         """Composite the enabled tracks (bottom first) for MarkIn..MarkOut and write EXR."""
         import numpy as np
-        on = [t for t in sorted(self.sources) if self.timeline.enabled.get(t)]
+        tl = self.timeline
+        tracks = sorted(self.sources) if self.sources else sorted(tl.tracks)
+        on = [t for t in tracks if tl.enabled.get(t)]
         assert self.fmt == ("exr", "RGBHalfZIP")
+
+        def source(t, fr):
+            if self.sources:
+                return Path(self.sources[t]) / f"f_{fr + 1:04d}.png"
+            for it in tl.tracks.get(t, []):
+                if it.start <= fr < it.start + it.duration and getattr(it.mpi, "files", None):
+                    return Path(it.mpi.files[fr - it.start + it.left_offset])
+            return None
         for fr in range(s["MarkIn"], s["MarkOut"] + 1):
             acc = None
             for t in on:
-                f = Path(self.sources[t]) / f"f_{fr + 1:04d}.png"
+                f = source(t, fr)
+                if f is None:
+                    continue
                 a = np.asarray(glitch.Image.open(f).convert("RGBA"), np.float32)
                 if acc is None:
                     acc = a
@@ -279,8 +365,10 @@ INPUTS = {
     "Glow": [("Input", "Input"), ("EffectMask", "Effect Mask"), ("GlowMask", "Glow Mask"),
              ("Glow", "Glow")],
     "ColorCorrector": [("Input", "Input"), ("EffectMask", "Effect Mask")],
-    "MediaIn": [], "MediaOut": [("Input", "Input")], "Note": [("Comments", "Comments")],
+    "MediaIn": [], "MediaOut": [("Input", "Input")],
 }
+for _v in INPUTS.values():
+    _v.append(("Comments", "Comments"))         # every Fusion tool has one
 
 
 class Input:
@@ -464,3 +552,6 @@ class Resolve:
 
     def Fusion(self):
         return Fusion()
+
+    def GetVersionString(self): return "fake"
+    def GetProductName(self): return "Fake Resolve (tests/fake_resolve.py)"

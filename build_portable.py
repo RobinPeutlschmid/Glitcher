@@ -71,7 +71,7 @@ def main() -> int:
     ap.add_argument("--no-zip", action="store_true", help="don't zip the result")
     args = ap.parse_args()
 
-    for f in ("glitch.py", "glitch_gui.py", "estimate_pose.py"):
+    for f in ("glitch.py", "glitch_gui.py", "estimate_pose.py", "glitch_numba.py"):
         if not (HERE / f).is_file():
             print(f"error: {f} must be next to build_portable.py", file=sys.stderr)
             return 2
@@ -133,6 +133,13 @@ def main() -> int:
         cmd += ["--hidden-import", "OpenEXR"]
     except ImportError:
         print("note: OpenEXR not installed - the app will read/write PNG only")
+    try:
+        import numba  # noqa: F401
+        # the compiled kernels: as a module, and as a plain .py file next to the app, which is
+        # what glitch.py loads them from when frozen (Numba keys its disk cache to a source file)
+        cmd += ["--hidden-import", "glitch_numba", "--add-data", f"{HERE / 'glitch_numba.py'}{sep}."]
+    except ImportError:
+        print("note: Numba not installed - the app renders with numpy (same frames, ~1.3x slower)")
 
     print(" ".join(cmd))
     subprocess.check_call(cmd)

@@ -85,6 +85,7 @@ jobs:
       GLITCHER_REQUIRE_EXR: "1"
       GLITCHER_REQUIRE_MINIAUDIO: "1"
       GLITCHER_REQUIRE_POSE: ${{ matrix.pose && '1' || '0' }}
+      GLITCHER_REQUIRE_NUMBA: ${{ matrix.name != 'macos-x64-nopose' && '1' || '0' }}   # no Intel Mac wheels
     defaults:
       run:
         shell: bash         # the same scripts on all three systems (Git Bash on Windows)

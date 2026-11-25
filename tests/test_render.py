@@ -217,3 +217,19 @@ def test_glitch_pass_exr(frames, tmp_path):
     assert (r == a).all() and r.max() > 0
     png = synth.load(_pass(tmp_path / "p")[0]) / 255.0
     assert np.abs(r - png).max() < 2.5 / 255                  # same matte as the PNG render
+
+
+def test_transitions_with_time_effects_dont_depend_on_workers(tmp_path):
+    """A transition changes the current frame before the time effects run; the motion cache
+    used to file that changed frame under the source's name, so the result depended on which
+    frames a worker rendered first (1 worker != 3 workers)."""
+    src = tmp_path / "moving"
+    synth.make_frames(src, 24, move=3.0)
+    args = ["-s", "4", "-i", "0.9", "--gain", "mosh=3,echo=2,stutter=2", "--appear", "2:0.5",
+            "--vanish", "16:0.4", "--fps", "12"]
+    a = render(src, tmp_path / "j1", *args, jobs=1)
+    b = render(src, tmp_path / "j3", *args, jobs=3)
+    assert all(synth.same_images(x, y) for x, y in zip(a, b))
+    part = render(src, tmp_path / "part", *args, "--range", "5-14", jobs=2)
+    full = {p.name: p for p in a}
+    assert all(synth.same_images(p, full[p.name]) for p in part)

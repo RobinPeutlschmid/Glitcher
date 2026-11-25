@@ -450,10 +450,19 @@ def measure(F: np.ndarray):
         return np.stack([v[:, 0] * cr + v[:, 1] * sr, -v[:, 0] * sr + v[:, 1] * cr], 1)
     sh2d, hp2d = unroll(ils - irs), unroll(ilh - irh)
 
-    # 2-D width cue: |cos yaw| from apparent shoulder width over torso length
+    # 2-D width cue: |cos yaw| from apparent shoulder width over torso length, against the same
+    # ratio of the metric 3-D skeleton (how this body looks frontal). That reference used to be
+    # the clip's widest view, which is only frontal if the person faces the camera at some point:
+    # a person held at 45 deg read as ~31 deg. The skeleton's own proportions need no frontal view.
     sw = sh2d[:, 0]                                               # signed: >0 front-ish
     ratio = np.where(ok & (torso > 1), np.abs(sw) / np.maximum(torso, 1), np.nan)
-    k = np.nanpercentile(ratio, 95) if np.isfinite(ratio).any() else 1.0
+    w_width = np.linalg.norm(ls - rs, axis=1)
+    w_torso = np.linalg.norm(down, axis=1)
+    k_body = np.where(ok & (w_torso > 1e-3), w_width / np.maximum(w_torso, 1e-3), np.nan)
+    if np.isfinite(k_body).any():
+        k = float(np.nanmedian(k_body))                           # bone proportions: one per person
+    else:
+        k = np.nanpercentile(ratio, 95) if np.isfinite(ratio).any() else 1.0
     cosm = np.nan_to_num(np.clip(ratio / max(k, 1e-6), 0, 1))
     a_sh, a_hp = np.radians(yaw_sh), np.radians(yaw_hp)
     side = np.sign(np.sin(a_sh) + 0.6 * np.sin(a_hp))             # which side: from depth

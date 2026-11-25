@@ -4,6 +4,125 @@ Version numbers: MAJOR.MINOR.PATCH. The version lives in one place, `__version__
 the GUI title, `--version` of every tool, saved presets and the portable build's zip name read it
 from there.
 
+## 1.7.0 — 2026-11-25
+
+### Faster
+- **Compiled kernels (Numba), with identical frames.** The three slowest loops are now
+  compiled when Numba is installed: echo's compositing (`_under`, also used by mosh and by the
+  3-D front/back layering), the noise grain, and the mosh replay. Each is the numpy code
+  rewritten as one loop over the pixels, with the same float32 operations in the same order.
+  The frames are byte-identical, and the tests compare them on edge-case pixels and whole
+  renders (PNG, EXR, 2-D, 3-D). Estimated on a real preset at 720x480: 1.34x per frame. On
+  synthetic 1080p frames: 1.3-1.7x.
+  - The first run on a machine compiles the kernels (about 10 s) into a disk cache. After
+    that they load in under a second. Renders compile once in the main process, so the
+    workers only load. The editor starts this in its preview worker when it opens.
+  - Memory: about 35 MB more per process that loads them. The editor's own process and its
+    playback workers stay on numpy, so the editor doesn't get heavier. The live preview and
+    the render workers use the kernels. The render worker memory estimate includes them.
+  - `GLITCHER_NUMBA=0` turns them off. `Glitcher --numba-check` says which code runs. The
+    CLI prints `render code: ...`.
+  - The mosh motion search stays numpy on purpose: numpy's float32 summation order can't be
+    reproduced exactly in a loop, and a last-bit difference could change a motion vector. It
+    is about 1 % of a frame.
+  - Packaging: the builds include Numba (+~50-60 MB zipped). The Intel Mac build doesn't,
+    because Numba has no Intel Mac wheels since 0.63, so it renders with numpy, with the same
+    frames. The frozen-app check now compares the app's compiled render with a numpy render
+    from source, and checks that the disk cache works inside the app.
+- `tools/gpu_bench.py` measures whether a GPU (CuPy) or compiled CPU code (Numba) would speed
+  up renders on the machine it runs on. It profiles a real render, then benchmarks ports of
+  the hot spots, each first checked bit for bit against glitch.py. Each variant then reports
+  whether its frames come out identical. It also measures CUDA start-up, VRAM, transfer
+  costs, and how throughput holds up with several workers. Writes `gpu_bench_result.json`.
+  Glitcher itself doesn't use it.
+  On an RTX 4060 laptop GPU, the GPU versions were fast, and their frames were identical.
+  They still lost overall: uploading and downloading frames ran at ~1.3 GB/s, CUDA took
+  4.7 s to start in each process, and the motion search was slower on the GPU (many small
+  arrays). Numba came out ahead (1.34x against 1.22-1.27x), needs no particular GPU, and is
+  bit-identical. That's why 1.7.0 uses Numba.
+
+## 1.6.0 — 2026-11-25
+
+### New
+- Resolve panel: **Check this Resolve**. On a throwaway timeline it asks Resolve every question
+  the plugin depends on: how sequences import, how clips are placed and trimmed, which inputs
+  Fusion's nodes have, how renders are named. It saves the answers to `resolve_probe.json`
+  and removes everything it made. Recorded reports go in `tests/resolve_contract/`, and the
+  tests then fail if the fake Resolve they use answers differently from the real one.
+- Testing: 157 tests, up from 73. See docs/TESTING.md.
+
+### Fixed
+- Pose estimation: a person who never faces the camera got the wrong yaw (held at 45 deg read
+  as 31 deg, at 135 deg as 149 deg). One cue was calibrated on the clip's widest view, assuming
+  a frontal moment. It now uses the body's own proportions from MediaPipe's metric skeleton.
+  Held poses are now exact; on a clip that does face the camera, results move by ≤ 3 deg.
+
+### Faster
+- Echo / datamosh compositing blends whole regions in one pass: renders are ~8 % faster with
+  default settings and ~10 % with heavy time effects, with bit-identical output.
+- The command line (and the Resolve plugin) now uses every CPU by default instead of at most 8;
+  the memory-aware pool lowers the count when RAM is short.
+
+### Removed
+- Dead code: an unused pixel helper, two attributes nothing read, and an unused plugin
+  function.
+
+## 1.5.3 — 2026-11-24
+
+### Fixed
+- Resolve plugin: Import latest still made a 1-frame clip (1.5.2 didn't fix it) and could jump
+  the playhead to ~18 hours. The plugin no longer depends on how Resolve numbers frames:
+  - Resolve's renders (named by timeline timecode, e.g. src_00090000.exr) are renamed to
+    src_0001.exr, src_0002.exr, ... right after rendering;
+  - after importing, the clip's frame count is checked; a wrong result (e.g. a single still)
+    is removed and the frames imported again as a list of files;
+  - the clip goes on the timeline whole (no start / end frame), checked for length and
+    position; only if that fails are explicit frame ranges tried, each wrong try removed;
+  - the playhead is put back where it was;
+  - every step is logged in the panel and in `panel.log` in the Glitcher Resolve folder.
+
+## 1.5.2 — 2026-11-24
+
+### Fixed
+- Resolve plugin: Import latest made a 1-frame, empty clip. The plugin asked Resolve for frames
+  0..n-1 of the imported sequence, but Resolve numbers an image sequence by its file numbers
+  (a render of the timeline is named after timeline frames, e.g. src_00086523.exr), so the
+  request fell outside the clip. It now uses the sequence's own numbers and checks that the clip
+  really is full length at the right spot. If not, it removes that placement and tries Resolve's
+  other conventions. If nothing fits, it stops with a message instead of leaving a broken clip.
+- A previous version's Fusion comp is only carried over if that version's clip was healthy.
+- The comp no longer gets a note that covered PassMatte and the GlitchPass Loader; each node
+  has a one-line comment instead (hover it).
+
+## 1.5.1 — 2026-11-24
+
+### Fixed
+- Editor: "Render sequence" could fail with "A process in the process pool was terminated
+  abruptly" or "Unable to allocate … MiB": the render ran out of memory.
+  - It started one render worker per CPU thread while the preview workers kept running.
+  - Each worker kept up to 650 MB of cached frames for the time effects. Measured, the cache
+    made rendering no faster at all; it only multiplied memory by the number of workers. The
+    caches are now 260 MB, and a long 1080p run peaks at ~650 MB per worker instead of 900+ MB
+    and still climbing.
+
+  Now:
+  - the number of workers is sized to the free memory, from measured long-run peaks (the
+    status bar says when it uses fewer);
+  - the preview workers are freed during a full render and come back after it;
+  - if a worker still dies or runs out of memory, the unfinished frames are rendered again
+    with half the workers,
+    down to one frame at a time. Same pixels, only slower. Only a frame that crashes a lone
+    worker stops the render, and the message names that frame and shows the worker's trace.
+- The command line and the Resolve plugin's renders use the same memory-aware, self-healing
+  pool.
+- Transitions (appear / vanish) with the time effects could give different pixels depending on
+  how frames were split between workers (1 worker ≠ 4 workers), because a per-worker cache mixed
+  up the dissolving frame with the clean one. Renders are now identical whatever the worker
+  count, and a partial re-render matches the full one again. (Transitions rendered before this
+  fix may differ slightly from new renders; everything else is bit-identical.)
+- `--install-resolve` from the packaged Windows app no longer waits on a message box when its
+  output is captured (it hung CI).
+
 ## 1.5.0 — 2026-11-24
 
 ### New

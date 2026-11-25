@@ -121,6 +121,7 @@ def test_full_render_matches_cli(app, tmp_path):
     app.vars["output"].set(str(out))
     app.render_all()
     assert pump(app.root, 300, lambda: app.render_cancel is None and len(list(out.glob("*.png"))) == 12)
+    assert app.play_pool is not None, "the preview workers must come back after a full render"
     ref = tmp_path / "cli_out"
     assert glitch.main(app.argv(with_output=False) + ["-o", str(ref), "-j", "1"]) == 0
     for f in sorted(out.glob("*.png")):

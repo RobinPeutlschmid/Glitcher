@@ -250,6 +250,19 @@ def _cpus() -> int:
     return max(1, min(MAX_WORKERS, os.cpu_count() or 1))
 
 
+# The compiled kernels (glitch_numba.py) cost each process that loads them ~35 MB of its own
+# memory. The single live-preview worker and the render workers use them; the playback workers
+# (one per core) don't, so the editor stays light. Frames are identical either way.
+PLAYBACK_NUMBA = False
+
+
+def _new_pool(which: str) -> ProcessPoolExecutor:
+    if which == "live_pool":
+        return ProcessPoolExecutor(1)
+    return ProcessPoolExecutor(max(1, _cpus() - 1),
+                               initializer=None if PLAYBACK_NUMBA else glitch.numpy_worker_init)
+
+
 # --------------------------------------------------------------------------- worker side
 def preview_job(job, scale: float):
     """Render one planned job at a reduced input size, return an 8-bit RGBA image for display.
@@ -543,8 +556,11 @@ class App:
         self._undo_i = -1
         self._undo_id = None
         self._restoring = False
-        self.live_pool = ProcessPoolExecutor(1)
-        self.play_pool = ProcessPoolExecutor(max(1, _cpus() - 1))
+        self.live_pool = _new_pool("live_pool")
+        self.play_pool = _new_pool("play_pool")
+        # load the compiled kernels in the preview worker now (the first time on a machine this
+        # compiles them, ~10 s, and caches them on disk for every later worker)
+        self.render_code = self.live_pool.submit(glitch.warm_fast)
 
         self.vars: dict[str, tk.Variable] = {}
         prefs = _load_prefs()
@@ -2230,7 +2246,7 @@ class App:
                 tkfont.nametofont(name).configure(family="Segoe UI", size=9)
         bold = base.copy()
         bold.configure(weight="bold")
-        self._bold = bold
+        self._bold = bold                     # keep a reference: Tk deletes fonts Python drops
         st.configure(".", background=P["bg"], foreground=P["fg"], fieldbackground=P["field"],
                      bordercolor=P["border"], darkcolor=P["bg"], lightcolor=P["bg"],
                      troughcolor=P["trough"], focuscolor=P["accent"], selectbackground=P["accent"],
@@ -2607,12 +2623,14 @@ class App:
 
     def _submit(self, which: str, *args):
         """Submit to a preview pool; if a worker died (e.g. out of memory), start a new pool."""
+        if getattr(self, which) is None:                  # freed during a full render
+            which = "live_pool"
         pool = getattr(self, which)
         try:
             return pool.submit(*args)
         except BrokenProcessPool:
             pool.shutdown(wait=False, cancel_futures=True)
-            setattr(self, which, ProcessPoolExecutor(1 if which == "live_pool" else max(1, _cpus() - 1)))
+            setattr(self, which, _new_pool(which))
             self.set_status("A preview worker crashed (out of memory?) - restarted it.", error=True)
             return getattr(self, which).submit(*args)
 
@@ -2789,30 +2807,33 @@ class App:
         self._stop_play()
         self._cancel_play_jobs()                        # don't compete with stale preview jobs
 
+        # the preview workers hold frames in memory: free them while the full render runs
+        self.play_pool.shutdown(wait=True, cancel_futures=True)   # gone before memory is measured
+        self.play_pool = None
+        px = glitch.canvas_px(work)
+        workers = glitch.safe_workers(_cpus(), px)
+        if workers < _cpus():
+            self.set_status(f"Rendering with {workers} of {_cpus()} workers: each needs about "
+                            f"{glitch.worker_bytes(px) / 1e9:.1f} GB "
+                            f"and that's what fits in free memory.", note=True)
+
         def run():
             t0 = time.time()
-            done = 0
-            ex = ProcessPoolExecutor(_cpus())
+            prog = [0]
+
+            def progress(d):
+                prog[0] = d
+                self.q.put(("render_progress", d, len(work)))
             try:
-                # runs of consecutive frames per task: time effects reuse neighbours and motion
-                ch = max(1, min(8, -(-len(work) // (_cpus() * 3))))
-                chunks = [work[i:i + ch] for i in range(0, len(work), ch)]
-                futs = [ex.submit(glitch._render_chunk, c) for c in chunks]
-                for f, c in zip(futs, chunks):
-                    while not f.done():
-                        if cancel.is_set():
-                            ex.shutdown(wait=False, cancel_futures=True)
-                            self.q.put(("render_done", done, len(work), time.time() - t0, True, None))
-                            return
-                        time.sleep(0.05)
-                    f.result()                          # raises the frame's error, if any
-                    done += len(c)
-                    self.q.put(("render_progress", done, len(work)))
-                ex.shutdown(wait=True)
-                self.q.put(("render_done", done, len(work), time.time() - t0, False, str(work[0][1].parent)))
-            except Exception as exc:                  # noqa: BLE001 - stop the rest right away
-                ex.shutdown(wait=False, cancel_futures=True)
-                self.q.put(("render_done", done, len(work), time.time() - t0, True, f"error: {exc}"))
+                done = glitch.render_pool(work, workers, progress=progress, cancel=cancel,
+                                          log=lambda m: self.q.put(("render_note", m)))
+                if cancel.is_set():
+                    self.q.put(("render_done", done, len(work), time.time() - t0, True, None))
+                else:
+                    self.q.put(("render_done", done, len(work), time.time() - t0, False,
+                                str(work[0][1].parent)))
+            except Exception as exc:                  # noqa: BLE001 - report, keep the editor alive
+                self.q.put(("render_done", prog[0], len(work), time.time() - t0, True, f"error: {exc}"))
         threading.Thread(target=run, daemon=True).start()
 
     # ----------------------------------------------------------------- Resolve jobs
@@ -3117,8 +3138,12 @@ class App:
                     _k, done, n = msg
                     self.progress.config(value=done)
                     self.set_status(f"Rendering {done}/{n}…")
+                elif kind == "render_note":
+                    self.set_status(msg[1], note=True)
                 elif kind == "render_done":
                     _k, done, n, dt, cancelled, info = msg
+                    if self.play_pool is None:                    # back for previews
+                        self.play_pool = _new_pool("play_pool")
                     self.render_cancel = None
                     self.render_btn.config(text="Render sequence")
                     if cancelled:
@@ -3147,7 +3172,7 @@ class App:
                 self.pose_proc.terminate()
             except OSError:
                 pass
-        for pool in (self.live_pool, self.play_pool):
+        for pool in (p for p in (self.live_pool, self.play_pool) if p is not None):
             pool.shutdown(wait=False, cancel_futures=True)
         try:
             shutil.rmtree(self._tmp_dir, ignore_errors=True)
@@ -3175,6 +3200,10 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
         print(f"{glitch.APP_NAME} {glitch.__version__}")
         raise SystemExit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == "--numba-check":
+        st = glitch.fast_status()                          # exit 0 = the compiled kernels run here
+        print(json.dumps(st))
+        raise SystemExit(0 if st["backend"] == "numba" else 3)
     if len(sys.argv) > 2 and sys.argv[1] == "--self-test":
         raise SystemExit(self_test(sys.argv[2]))
     if len(sys.argv) > 2 and sys.argv[1] == "--render-job":
@@ -3275,8 +3304,10 @@ def self_test(inp: str, timeout: float = 120.0) -> int:
         while time.time() - t0 < timeout:
             root.update()
             if app.plan is not None and app.current_img is not None:
+                code = app.render_code.result(timeout=max(1.0, timeout - (time.time() - t0)))
                 app.close()
-                print(f"self-test OK: first preview in {time.time() - t0:.1f} s")
+                print(f"self-test OK: first preview in {time.time() - t0:.1f} s; preview worker "
+                      f"renders with {code}")
                 return 0
             time.sleep(0.02)
         msg = app.status.cget("text")

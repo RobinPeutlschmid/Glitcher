@@ -190,7 +190,7 @@ from __future__ import annotations
 import argparse
 import copy
 
-__version__ = "1.5.0"
+__version__ = "1.7.0"
 APP_NAME = "Glitcher"
 import glob as _glob
 import json
@@ -200,7 +200,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from collections import OrderedDict  # noqa: F401  (type hints of the per-process caches)
 from dataclasses import dataclass, replace as _dc_replace
 from functools import lru_cache
@@ -235,6 +238,94 @@ _SCHED = {
 # so more are spawned to keep a similar amount of visible glitch.
 _PLANE_BOOST = 3.0
 _LAYERED = {"jpeg", "blocks", "slices", "wave", "sort", "smear"}
+
+
+# --------------------------------------------------------------------------- compiled kernels
+# glitch_numba.py holds Numba versions of _under, fx_noise's grain and fx_mosh's replay: the
+# same arithmetic as the numpy code below, so the frames are identical either way, ~1.3-1.7x
+# faster per frame. Used when Numba is installed and GLITCHER_NUMBA isn't 0; loaded on first
+# use in each process (the editor's own process never needs it).
+_FAST = None                       # the glitch_numba module, False = numpy; None = not tried yet
+FAST_STATUS = "not loaded yet"
+
+
+def _user_cache_dir() -> Path:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches"
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base / APP_NAME
+
+
+def _fast():
+    """The compiled kernels, or False to use numpy. Loads them the first time it's asked."""
+    global _FAST, FAST_STATUS
+    if _FAST is not None:
+        return _FAST
+    _FAST = False
+    if os.environ.get("GLITCHER_NUMBA", "1").strip().lower() in ("0", "off", "no", "false"):
+        FAST_STATUS = "numpy (GLITCHER_NUMBA=0)"
+        return _FAST
+    t0 = time.time()
+    try:
+        # Compiled code is cached on disk, keyed to the source file. In the packaged app the
+        # module is loaded from its bundled .py file (PyInstaller keeps modules in an archive,
+        # where Numba can't key a cache), and the cache goes to the user's cache folder.
+        os.environ.setdefault("NUMBA_CACHE_DIR", str(_user_cache_dir() / "numba"))
+        src = Path(getattr(sys, "_MEIPASS", "")) / "glitch_numba.py"
+        if getattr(sys, "frozen", False) and src.is_file():
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("glitch_numba", src)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            sys.modules["glitch_numba"] = mod
+        else:
+            import glitch_numba as mod
+        import numba
+    except ImportError as e:
+        FAST_STATUS = ("numpy (Numba is not installed)" if getattr(e, "name", "") in ("numba", "llvmlite")
+                       else f"numpy (could not load the compiled kernels: {e})")
+        return _FAST
+    except Exception as e:                                  # noqa: BLE001 - numpy is always there
+        FAST_STATUS = f"numpy (the compiled kernels failed: {type(e).__name__}: {e})"
+        return _FAST
+    _FAST = mod
+    FAST_STATUS = f"numba {numba.__version__} ({time.time() - t0:.1f} s to load)"
+    return _FAST
+
+
+def fast_status() -> dict:
+    """Which code renders, and whether the compiled kernels came from the disk cache."""
+    F = _fast()
+    d = {"backend": "numba" if F else "numpy", "status": FAST_STATUS}
+    if F:
+        import numba
+        kern = [F.any_alpha, F.under_u8, F.noise_u8, F.replay]
+        d.update(numba=numba.__version__, cache_dir=numba.config.CACHE_DIR,
+                 cache_hits=sum(sum(k.stats.cache_hits.values()) for k in kern),
+                 cache_misses=sum(sum(k.stats.cache_misses.values()) for k in kern),
+                 signatures=sum(len(k.signatures) for k in kern))
+        d["from_cache"] = d["cache_hits"] == d["signatures"]
+    return d
+
+
+def warm_fast() -> str:
+    """Load (the first time on a machine: compile) the kernels in this process; -> status."""
+    _fast()
+    return FAST_STATUS
+
+
+def numpy_worker_init():
+    """Initializer for worker processes that should stay on numpy (the editor's playback)."""
+    global _FAST, FAST_STATUS
+    _FAST, FAST_STATUS = False, "numpy (playback worker)"
+
+
+def _c(a):
+    """a as a C-contiguous, writable array (what the kernels' signatures take); copies if not."""
+    return a if a.flags.c_contiguous and a.flags.writeable else np.array(a, order="C")
 
 
 # --------------------------------------------------------------------------- time / randomness
@@ -538,13 +629,6 @@ def _neq(a, b):
     return _px(a) != _px(b) if a.dtype == np.uint8 else np.any(a != b, axis=2)
 
 
-def _fin(x, like):
-    """Store float results the way `like` stores pixels: uint8 images round and clip to 0..255
-    (callers that truncate keep their own astype); float images keep full precision - values above
-    255 (HDR highlights) survive, only negatives are clipped and alpha stays within 0..255."""
-    return np.clip(x + 0.5, 0, 255).astype(np.uint8) if like.dtype == np.uint8 else np.maximum(x, 0).astype(np.float32)
-
-
 def _content_box(a, margin: int = 0):
     """(y0, y1, x0, x1) around every pixel with any non-zero channel, grown by `margin` and
     clipped to the image; None if the image is all zero. Outside it the image is all zero, so
@@ -569,44 +653,55 @@ def _ghost(back, a):
 
 def _under(front, ghost):
     """Alpha-composite `ghost` underneath `front`. Only pixels the ghost covers are blended; the
-    rest equal `front` (with colour cleared where nothing is visible)."""
+    rest equal `front` (with colour cleared where nothing is visible). Touches only the pixels
+    that change (this sits under every echo layer, so it was a hot spot)."""
+    if (front.dtype == np.uint8 and ghost.dtype == np.uint8 and front.shape == ghost.shape
+            and front.ndim == 3 and front.shape[2] == 4):
+        F = _FAST if _FAST is not None else _fast()
+        if F:
+            g = _c(ghost)
+            if not F.any_alpha(g):
+                return front
+            out = np.empty(front.shape, np.uint8)
+            F.under_u8(_c(front), g, out)
+            return out
     gm = ghost[..., 3] > 0
     if not gm.any():
         return front
     out = front.copy()
-    out[(front[..., 3] == 0) & ~gm, :3] = 0
+    np.copyto(out[..., :3], 0, where=((front[..., 3] == 0) & ~gm)[..., None])
     rows, cols = np.flatnonzero(gm.any(axis=1)), np.flatnonzero(gm.any(axis=0))
     y0, y1, x0, x1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
-    sub = _under_box(front[y0:y1, x0:x1], ghost[y0:y1, x0:x1], gm[y0:y1, x0:x1])
-    if sub is not None:                                 # only the ghost's bounding box can change
-        out[y0:y1, x0:x1] = np.where(gm[y0:y1, x0:x1, None], sub, out[y0:y1, x0:x1])
+    fb, m = front[y0:y1, x0:x1], gm[y0:y1, x0:x1]
+    if front.dtype == np.uint8:                         # fully covered by front: front wins exactly
+        m &= fb[..., 3] < 255
+    else:                                               # (float: unless negatives need clamping)
+        m &= (fb[..., 3] < 255) | (fb[..., :3].min(axis=2) < 0)
+    if m.any():
+        gb = ghost[y0:y1, x0:x1]
+        if m.mean() > 0.25:          # mostly covered: blend the whole box at once, keep the masked
+            np.copyto(out[y0:y1, x0:x1], _under_px(fb, gb), where=m[..., None])
+        else:                        # sparse: only the masked pixels
+            out[y0:y1, x0:x1][m] = _under_px(fb[m], gb[m])
     return out
 
 
-def _under_box(front, ghost, gm):
-    """_under's blend inside a box; None if nothing there needs blending."""
-    out = front.copy()
-    if front.dtype == np.uint8:                         # fully covered by front: front wins exactly
-        gm &= front[..., 3] < 255
-    else:                                               # (float: unless negatives need clamping)
-        gm &= (front[..., 3] < 255) | (front[..., :3].min(axis=2) < 0)
-    if not gm.any():
-        return None
-    f, g = front[gm], ghost[gm]                                   # (n,4) each
-    fa = f[:, 3].astype(np.float32) / 255.0
-    ga = g[:, 3].astype(np.float32) / 255.0
+def _under_px(f, g):
+    """The blend of front pixels over ghost pixels, (..., 4) each: the same per-pixel arithmetic
+    for a list of pixels or a whole box."""
+    fa = f[..., 3].astype(np.float32) / 255.0
+    ga = g[..., 3].astype(np.float32) / 255.0
     oa = fa + ga * (1 - fa)
     inv = np.where(oa > 0, 1.0 / np.maximum(oa, 1e-6), 0.0)
-    rgb = (f[:, :3] * fa[:, None] + g[:, :3] * (ga * (1 - fa))[:, None]) * inv[:, None]
+    rgb = (f[..., :3] * fa[..., None] + g[..., :3] * (ga * (1 - fa))[..., None]) * inv[..., None]
     blended = np.empty_like(f)
     if f.dtype == np.uint8:
-        blended[:, :3] = np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
-        blended[:, 3] = np.clip(oa * 255 + 0.5, 0, 255).astype(np.uint8)
+        blended[..., :3] = np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
+        blended[..., 3] = np.clip(oa * 255 + 0.5, 0, 255).astype(np.uint8)
     else:
-        blended[:, :3] = np.maximum(rgb, 0)
-        blended[:, 3] = np.clip(oa * 255, 0, 255)
-    out[gm] = blended
-    return out
+        blended[..., :3] = np.maximum(rgb, 0)
+        blended[..., 3] = np.clip(oa * 255, 0, 255)
+    return blended
 
 
 def _rotate_rgba(arr, deg: float, center):
@@ -714,11 +809,11 @@ def fx_jpeg(a, c: Ctx):
     x0, y0, x1, y1 = c.bbox
     bw, bh = x1 - x0, y1 - y0
     # JPEG has no alpha: fill transparent area with the mean visible colour (less ringing)
-    base = np.where(vis[..., None], a[..., :3], a[..., :3][vis].mean(0)).astype(np.float32)
-    base8 = np.ascontiguousarray(base[:gh * 8, :gw * 8])
+    base8 = a[:gh * 8, :gw * 8, :3].astype(np.float32)   # same values as a float64 where(), cast once
+    np.copyto(base8, a[..., :3][vis].mean(0).astype(np.float32), where=~vis[:gh * 8, :gw * 8, None])
     blocks = base8.reshape(gh, 8, gw, 8, 3).transpose(0, 2, 1, 3, 4)       # (gh,gw,8,8,3) view
     Q = _qtabs(c.p.quality if c.p.quality else int(75 - 55 * c.p.intensity))
-    dil = _dilate(vis, c.bleed) if c.bleed > 0 else vis
+    dil = None                                           # the spill area, only if a run needs it
     out = a.copy()
     for ev in evs:
         e = _env(ev.u) * ev.g
@@ -775,6 +870,8 @@ def fx_jpeg(a, c: Ctx):
         inside = mp & vis[ys, xs]
         sub[..., :3][inside] = np.rint(reg[inside]) if a.dtype == np.uint8 else reg[inside]
         if c.bleed > 0:                                  # junk may spill past the silhouette
+            if dil is None:
+                dil = _dilate(vis, c.bleed)
             spill = mp & dil[ys, xs] & ~vis[ys, xs]
             if kind != 0:
                 spill &= np.abs(reg - base8[ys, xs]).sum(2) > 90
@@ -1086,6 +1183,11 @@ def fx_noise(a, c: Ctx):
     vis = a[..., 3] > 0
     rng = np.random.default_rng((c.p.seed, FX_ID["noise"], 0, c.fi))     # fresh grain per frame
     n = rng.normal(0, (3 + 10 * c.p.intensity) * gn, size=a.shape[:2])   # full size: same grain
+    F = _fast() if a.dtype == np.uint8 and a.shape[2] == 4 else False
+    if F:
+        out = np.empty(a.shape, np.uint8)
+        F.noise_u8(_c(a), _c(n), out)
+        return out
     out = a.copy()
     res = a[..., :3][vis].astype(np.float32) + n[vis].astype(np.float32)[:, None]
     out[..., :3][vis] = (np.clip(res, 0, 255).astype(np.uint8) if a.dtype == np.uint8 else np.maximum(res, 0))
@@ -1095,7 +1197,8 @@ def fx_noise(a, c: Ctx):
 # --------------------------------------------------------------------------- time effects
 _PREP: "OrderedDict" = None        # prepared (converted + padded) history frames, per process
 _PREP_BYTES = [0]
-_PREP_BUDGET = 500_000_000
+_PREP_BUDGET = 160_000_000       # measured: a bigger cache didn't render any faster, it only
+                                 # multiplied memory by the number of workers
 
 
 class _History:
@@ -1161,7 +1264,11 @@ class _History:
 
     def key(self, k: int):
         if k == 0:
-            return self.cur_key
+            # The frame being rendered is never cached: it may already be changed (a transition
+            # dissolves it before the time effects run), while the same file seen from a later
+            # frame is the clean source. One cache name for both made the result depend on which
+            # frames a worker had rendered before (1 worker != 4 workers).
+            return None
         f = getattr(self.src, "key", None)
         return f(k) if f else None
 
@@ -1402,11 +1509,17 @@ def fx_mosh(a, c: Ctx):
         gain = 1.0 + 1.5 * c.p.intensity * (P[6] - 0.6) / 0.4 if P[6] > 0.6 else 1.0   # 'bloom'
         m = int(min(lag, 8) * _MR * s * gain) + 2
         cy0, cy1, cx0, cx1 = max(0, ya - m), min(h, yb + m), max(0, xa - m), min(w, xb + m)
-        base = c.hist.get(lag).copy()
+        base = np.array(c.hist.get(lag), order="C")          # a writable copy
         Y = np.arange(cy0, cy1)
         X = np.arange(cx0, cx1)
+        F = _fast() if base.dtype in (np.uint8, np.float32) and base.shape[2] == 4 else False
+        tmp = np.empty((cy1 - cy0, cx1 - cx0, 4), base.dtype) if F else None
         for k in range(lag - 1, -1, -1):                     # replay motion up to the current frame
             vy, vx, bs = _motion(c.hist, k, s)
+            if F and vy.dtype == np.int32 and vx.dtype == np.int32:
+                F.replay(base, _c(vy), _c(vx), int(bs), int(cy0), int(cy1), int(cx0), int(cx1),
+                         float(gain), int(h), int(w), tmp)
+                continue
             iy = np.clip(Y // bs, 0, vy.shape[0] - 1)
             ix = np.clip(X // bs, 0, vy.shape[1] - 1)
             dy = np.round(vy[iy][:, ix] * gain).astype(np.int64)
@@ -1463,7 +1576,6 @@ class Pose:
         self.dense = dense(yaws_deg, unwrap)
         self.dense_pitch = dense(pitch_deg)
         self.dense_roll = dense(roll_deg)
-        self.has_pitch, self.has_roll = pitch_deg is not None, roll_deg is not None
 
         def dense_lin(vals, log=False):        # not angles: no radians; scale interpolates in log
             v = np.asarray(vals, float)[order]
@@ -2762,7 +2874,7 @@ class SeqHistory:
 
     _cache: "OrderedDict" = None          # per process: neighbouring frames get asked for again
     _bytes = 0
-    BUDGET = 150_000_000
+    BUDGET = 100_000_000
 
     def __init__(self, paths, io=None, size=None, plates=None, frames=None):
         self.paths, self.io, self.size = list(paths), io, size
@@ -2882,6 +2994,173 @@ def _render_chunk(jobs):
     return [_render(j) for j in jobs]
 
 
+# --------------------------------------------------------------------------- render pool
+# Measured high-water mark of one render worker over a long run (time effects, glitch pass,
+# EXR): ~650 MB at 1920x1080, ~1.5 GB at 3840x2160, i.e. about 360 MB + 140 bytes per canvas
+# pixel. The estimate adds ~20 % headroom (plates, big look-backs).
+WORKER_BASE_BYTES = 450_000_000
+WORKER_BYTES_PER_PX = 170
+MEMORY_SHARE = 0.75                   # of the memory free at the start, for the render workers
+NUMBA_WORKER_BYTES = 90_000_000       # Numba + LLVM + the loaded kernels, per worker (measured ~78 MB)
+
+
+def _numba_expected() -> bool:
+    """Will the workers load the compiled kernels? (Asked without importing Numba here.)"""
+    if os.environ.get("GLITCHER_NUMBA", "1").strip().lower() in ("0", "off", "no", "false"):
+        return False
+    import importlib.util
+    try:
+        return importlib.util.find_spec("numba") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def worker_bytes(canvas_px: int) -> int:
+    """Estimated high-water memory of one render worker."""
+    return int(WORKER_BASE_BYTES + WORKER_BYTES_PER_PX * max(1, canvas_px)
+               + (NUMBA_WORKER_BYTES if _numba_expected() else 0))
+
+
+def available_memory() -> int | None:
+    """Free physical memory in bytes, or None if this system won't say."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = MS()
+            ms.dwLength = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return int(ms.ullAvailPhys)
+            return None
+        if sys.platform.startswith("linux"):
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+            return None
+        total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")   # macOS: no "free" figure
+        return int(total * 0.6)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def safe_workers(requested: int, canvas_px: int, avail: int | None = None) -> int:
+    """How many render workers fit in memory (at least 1, at most `requested`)."""
+    avail = available_memory() if avail is None else avail
+    if not avail:
+        return max(1, requested)
+    return max(1, min(requested, int(avail * MEMORY_SHARE // worker_bytes(canvas_px))))
+
+
+class RenderCrash(RuntimeError):
+    """A worker process died even when rendering alone: a crash, not a lack of memory."""
+
+
+def _worker_init(crash_log):
+    """Each worker writes a Python trace to crash_log if it dies of a native crash."""
+    import faulthandler
+    try:
+        faulthandler.enable(open(crash_log, "a", encoding="utf-8"))   # noqa: SIM115 - lives with the process
+    except OSError:
+        pass
+
+
+def _tail(path, n=12):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return "".join(f.readlines()[-n:]).strip()
+    except OSError:
+        return ""
+
+
+def canvas_px(work) -> int:
+    """Pixels of one output canvas (input size grown by the pad), for the memory estimate."""
+    if not work:
+        return 1
+    try:
+        with Image.open(work[0][0]) as im:
+            w, h = im.size
+    except OSError:
+        return 1
+    pad = float((work[0][4] or {}).get("pad") or 0.0)
+    return int(w * (1 + 2 * pad)) * int(h * (1 + 2 * pad))
+
+
+def render_pool(work, workers: int, progress=None, cancel=None, log=None, chunk_fn=None) -> int:
+    """Render `work` (planned jobs) with up to `workers` processes; returns the frames done.
+
+    Consecutive frames go to the same worker (the time effects reuse loaded neighbours). If a
+    worker process dies - usually the system ran out of memory and killed it - the frames not
+    finished yet are rendered again with half the workers, down to one, then one frame at a
+    time. Only a frame that crashes a lone worker is an error (RenderCrash, with the frame and
+    the worker's trace). Frames are independent, so a retry gives the same pixels.
+    chunk_fn replaces the per-worker function (tests use it to kill workers on purpose)."""
+    log = log or (lambda m: print(m, file=sys.stderr))
+    chunk_fn = chunk_fn or _render_chunk
+    n = len(work)
+    crash_log = os.path.join(tempfile.gettempdir(), f"glitcher_worker_{os.getpid()}.log")
+    pending = list(range(n))                                  # indexes into work, in order
+    workers, solo, cause = max(1, int(workers)), False, None
+    try:
+        while pending:
+            ch = 1 if solo else max(1, min(8, -(-len(pending) // (workers * 3))))
+            chunks = [pending[i:i + ch] for i in range(0, len(pending), ch)]
+            ex = ProcessPoolExecutor(workers, initializer=_worker_init, initargs=(crash_log,))
+            futs = [(ex.submit(chunk_fn, [work[i] for i in c]), c) for c in chunks]
+            broken = None
+            try:
+                for f, c in futs:
+                    while not f.done():
+                        if cancel is not None and cancel.is_set():
+                            return n - len(pending)
+                        time.sleep(0.05)
+                    try:
+                        f.result()                            # a frame's own error is raised here
+                    except (BrokenProcessPool, MemoryError) as e:
+                        broken, cause = c, e                  # killed, or out of memory: fewer workers
+                        break
+                    pending = [i for i in pending if i not in set(c)]
+                    if progress:
+                        progress(n - len(pending))
+            finally:
+                ex.shutdown(wait=broken is None and not (cancel is not None and cancel.is_set()),
+                            cancel_futures=True)
+            if broken is None:
+                continue
+            finished = {i for f, c in futs if f.done() and not f.cancelled() and f.exception() is None
+                        for i in c}
+            pending = [i for i in pending if i not in finished]
+            if progress:
+                progress(n - len(pending))
+            if solo:
+                name = Path(work[broken[0]][0]).name
+                if isinstance(cause, MemoryError):
+                    raise RenderCrash(f"not enough memory to render {name} even one frame at a time "
+                                      f"({cause}). Close other programs, or lower the canvas padding.")
+                trace = _tail(crash_log)
+                raise RenderCrash(f"rendering {name} crashed the render process even on its own, so "
+                                  f"it is not a memory problem."
+                                  + (f"\n\nWorker trace:\n{trace}" if trace else ""))
+            if workers == 1:
+                solo = True
+            workers = max(1, workers // 2)
+            log(("a render worker ran out of memory" if isinstance(cause, MemoryError) else
+                 "a render worker died (most likely out of memory)") + "; rendering the remaining "
+                f"{len(pending)} frame(s) with {workers} worker(s)" + (", one frame at a time" if solo else ""))
+        return n
+    finally:
+        try:
+            os.remove(crash_log)
+        except OSError:
+            pass
+
+
 def _gather(inp: str):
     """-> (kind, [paths]) where kind is 'dir', 'glob' or 'file'."""
     pth = Path(inp)
@@ -2987,7 +3266,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="dematerialise at these frames: breaks apart and is gone afterwards")
     gt.add_argument("--trans-len", type=float, default=1.0, metavar="SEC",
                     help="default appear / vanish length in seconds (default 1.0)")
-    ap.add_argument("-j", "--jobs", type=int, default=0, help="worker processes (0 = auto)")
+    ap.add_argument("-j", "--jobs", type=int, default=0,
+                    help="worker processes (0 = auto: every CPU, fewer if memory is short)")
     ge = ap.add_argument_group("output format / EXR")
     ge.add_argument("--format", choices=["auto", "png", "exr"], default="auto",
                     help="output file type (default auto: same as the input, EXR stays EXR)")
@@ -3026,7 +3306,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "in seconds (default 0)")
     g3.add_argument("--pose-unwrap", action="store_true",
                     help="treat yaw jumps > 180 deg between keys as wrap-around (tracker data); "
-                         "default takes keys literally, like animation curves")
+                         "default takes keys literally, like animation curves. Only changes the "
+                         "result where angles are blended: --pose-smooth, or keys not on every frame")
     g3.add_argument("--lock", type=float, default=1.0,
                     help="share of the turn the glitch volume follows: 1 glued, 0 ignores (default 1)")
     g3.add_argument("--cam-dist", type=float, default=None,
@@ -3160,7 +3441,8 @@ def plan_render(args, notes: list | None = None, scan_cache: dict | None = None,
         raise PlanError("--trim changes frame size; use it for a single frame only")
 
     # ---- pass 1: layout boxes (cheap: alpha only)
-    jobs = args.jobs or min(os.cpu_count() or 1, 8)
+    # every CPU by default (the pool fits the count to free memory); Windows pools max out at 61
+    jobs = args.jobs or max(1, min(61, os.cpu_count() or 1))
     jobs = 1 if len(items) < 3 else jobs
     uniq = list(dict.fromkeys(s for s, _, _ in items))
     scan_of = {} if scan_cache is None else scan_cache
@@ -3377,12 +3659,19 @@ def main(argv=None) -> int:
         if tty:
             print(f"\r{i}/{n}", end="", file=sys.stderr, flush=True)
 
+    _fast()       # load (first time on a machine: compile) once here, so the workers just load
+    print(f"render code: {FAST_STATUS}", file=sys.stderr)
     if jobs > 1:
-        with ProcessPoolExecutor(jobs) as ex:
-            # runs of consecutive frames per worker: the time effects reuse loaded neighbours/motion
-            chunk = max(2, min(12, -(-len(work) // (jobs * 3))))
-            for i, _ in enumerate(ex.map(_render, work, chunksize=chunk), 1):
-                tick(i)
+        px = canvas_px(work)
+        fit = safe_workers(jobs, px)
+        if fit < jobs:
+            print(f"note: {fit} worker(s) instead of {jobs}: each needs about "
+                  f"{worker_bytes(px) / 1e9:.1f} GB", file=sys.stderr)
+        try:
+            render_pool(work, fit, progress=tick)
+        except RenderCrash as ex:
+            print(f"error: {ex}", file=sys.stderr)
+            return 1
     else:
         for i, w_ in enumerate(work, 1):
             _render(w_)

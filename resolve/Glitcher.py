@@ -19,23 +19,20 @@ import glob as _glob
 import json
 import os
 import re
-import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import time
+import zlib
 
-PLUGIN_VERSION = "1.5.0"
+PLUGIN_VERSION = "1.7.0"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".glitcher_resolve.json")
 IMG_EXTS = (".exr", ".png", ".tif", ".tiff")
 TRACK_NAME = "Glitcher"
 BIN_NAME = "Glitcher"
 PASS_LOADER = "GlitchPass"
 RESTORE_PRESET = "__glitcher_restore__"
-NOTE_TEXT = ("Glitcher: MediaIn = the glitch, GlitchPass = where the glitch is (white).\n"
-             "PassMatte Low / High: which glitch counts (raise Low to keep only hard glitches).\n"
-             "GlitchGlow: light from the glitch only (pass on its Glow Mask input).\n"
-             "GlitchGrade: colour of the glitch only. Select GlitchPass and press 1 to see the pass.")
-
 
 class GlitcherError(Exception):
     """A problem to show the user (not a bug)."""
@@ -49,13 +46,6 @@ def load_config(path=CONFIG_PATH):
         return cfg if isinstance(cfg, dict) else {}
     except (OSError, ValueError):
         return {}
-
-
-def save_config(cfg, path=CONFIG_PATH):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-    os.replace(tmp, path)
 
 
 def glitcher_command(cfg):
@@ -100,6 +90,22 @@ def scan_sequence(folder):
     items.sort()
     return {"prefix": prefix, "digits": digits, "ext": ext, "folder": folder,
             "numbers": [i for i, _ in items], "files": [os.path.join(folder, n) for _, n in items]}
+
+
+def renumber(seq, prefix):
+    """Rename a sequence to prefix0001.ext, prefix0002.ext, ... Resolve names its renders by
+    the timeline's timecode (a timeline starting at 01:00:00:00 at 25 fps begins at frame
+    90000); small numbers from 1 keep every later step free of Resolve's numbering."""
+    folder, ext = seq["folder"], seq["ext"]
+    digits = max(4, len(str(len(seq["files"]))))
+    tmp = []
+    for i, f in enumerate(seq["files"]):                        # two steps: names may overlap
+        t = os.path.join(folder, ".renum_%06d%s" % (i, ext))
+        os.replace(f, t)
+        tmp.append(t)
+    for i, t in enumerate(tmp, 1):
+        os.replace(t, os.path.join(folder, "%s%0*d%s" % (prefix, digits, i, ext)))
+    return scan_sequence(folder)
 
 
 def printf_pattern(seq):
@@ -258,6 +264,32 @@ def _items(d):
     if isinstance(d, dict):
         return [d[k] for k in sorted(d)]
     return list(d)
+
+
+def _unique(values):
+    out = []
+    for v in values:
+        if v is not None and v not in out:
+            out.append(v)
+    return out
+
+
+def clip_frames(clip):
+    """Frames in a Media Pool clip, from its 'Frames' property (None if Resolve won't say)."""
+    try:
+        v = str(clip.GetClipProperty("Frames") or "").strip()
+    except Exception:                                           # noqa: BLE001
+        return None
+    return int(v) if v.isdigit() else None
+
+
+def _start_property(clip):
+    """A Media Pool clip's first frame number, if its 'Start' property is a plain number."""
+    try:
+        v = str(clip.GetClipProperty("Start") or "").strip()
+    except Exception:                                           # noqa: BLE001
+        return None
+    return int(v) if v.isdigit() else None
 
 
 def _int_or_none(obj, method):
@@ -423,7 +455,8 @@ class Session(object):
             seq = scan_sequence(target)
         elif n != info["duration"]:
             raise GlitcherError("Resolve rendered %d frames, the clip has %d" % (n, info["duration"]))
-        return seq
+        self._last_raw_names = [os.path.basename(f) for f in seq["files"]]   # for the probe
+        return renumber(seq, name)
 
     # ---------------------------------------------------------------- import
     def _bin(self):
@@ -434,25 +467,57 @@ class Session(object):
         return self.media_pool.AddSubFolder(root, BIN_NAME)
 
     def import_sequence(self, files, clip_name):
+        """Import frames as ONE clip of len(files) frames, checked: first as Resolve's sequence
+        pattern (name_%04d.exr + StartIndex / EndIndex), else as the list of files. A wrong
+        result (e.g. a single still) is removed from the bin before the next try."""
         seq = scan_sequence(os.path.dirname(files[0]))
         names = set(os.path.basename(f) for f in files)
         nums = [n for n, f in zip(seq["numbers"], seq["files"]) if os.path.basename(f) in names]
-        clips = _items(self.media_pool.ImportMedia([{"FilePath": printf_pattern(seq),
-                                                     "StartIndex": nums[0], "EndIndex": nums[-1]}]))
-        if not clips:
-            raise GlitcherError("Resolve could not import %s" % printf_pattern(seq))
-        clip = clips[0]
-        for setter in (lambda: clip.SetName(clip_name), lambda: clip.SetClipProperty("Clip Name", clip_name)):
+        n = len(files)
+        attempts = [("pattern %s [%d-%d]" % (os.path.basename(printf_pattern(seq)), nums[0], nums[-1]),
+                     [{"FilePath": printf_pattern(seq), "StartIndex": nums[0], "EndIndex": nums[-1]}]),
+                    ("list of %d files" % n, list(files))]
+        tried = []
+        for label, arg in attempts:
             try:
-                if setter():
-                    break
-            except Exception:                                   # noqa: BLE001 - older Resolve
+                clips = _items(self.media_pool.ImportMedia(arg))
+            except Exception as ex:                             # noqa: BLE001
+                tried.append("%s: %s" % (label, ex))
                 continue
-        return clip
+            got = [clip_frames(c) for c in clips]
+            self.log("import as %s -> %d clip(s), frames %s" % (label, len(clips), got))
+            if len(clips) == 1 and got[0] in (n, None):
+                clip = clips[0]
+                for setter in (lambda: clip.SetName(clip_name),
+                               lambda: clip.SetClipProperty("Clip Name", clip_name)):
+                    try:
+                        if setter():
+                            break
+                    except Exception:                           # noqa: BLE001 - older Resolve
+                        continue
+                return clip, nums[0]
+            tried.append("%s gave %d clip(s) of %s frames" % (label, len(clips), got))
+            try:
+                self.media_pool.DeleteClips(clips)
+            except Exception:                                   # noqa: BLE001
+                pass
+        raise GlitcherError("Resolve did not import the %d frames as one clip (%s). In the Media Pool, "
+                            "check that 'Show Individual Frames' is off, then Import latest again."
+                            % (n, "; ".join(tried)))
 
-    def place(self, clip, info, n, under_uid=None):
-        """Put the glitch on a new track above the clip, at the clip's position."""
+    def place(self, clip, info, n, first_number=None):
+        """Put the glitch on a new track above the clip, at the clip's position, checked.
+
+        The imported clip holds exactly the n frames, so it goes on WHOLE (no start / end frame:
+        nothing depends on how Resolve numbers a clip's frames). Only if that doesn't come out as
+        n frames at the right spot are explicit ranges tried (0-based, then the clip's own
+        numbers). Every wrong placement is removed and the playhead put back."""
         tl = self.timeline
+        playhead = None
+        try:
+            playhead = tl.GetCurrentTimecode()
+        except Exception:                                       # noqa: BLE001
+            pass
         if not tl.AddTrack("video"):
             raise GlitcherError("could not add a video track")
         idx = int(tl.GetTrackCount("video"))
@@ -460,16 +525,39 @@ class Session(object):
             tl.SetTrackName("video", idx, TRACK_NAME)
         except Exception:                                       # noqa: BLE001
             pass
-        items = _items(self.media_pool.AppendToTimeline([{
-            "mediaPoolItem": clip, "startFrame": 0, "endFrame": n - 1, "trackIndex": idx,
-            "recordFrame": info["start"], "mediaType": 1}]))
-        if not items:
-            raise GlitcherError("could not place the glitch on the timeline")
-        new = items[0]
-        if int(new.GetStart()) != info["start"] or int(new.GetDuration()) != n:
-            self.log("note: the glitch landed at %s for %s frames (expected %s for %s)"
-                     % (new.GetStart(), new.GetDuration(), info["start"], n))
-        return new, idx
+        base = {"mediaPoolItem": clip, "trackIndex": idx, "recordFrame": info["start"], "mediaType": 1}
+        tries = [("whole clip", dict(base))]
+        for s0 in _unique([0, first_number, _start_property(clip)]):
+            tries.append(("frames %d-%d" % (s0, s0 + n - 1), dict(base, startFrame=s0, endFrame=s0 + n - 1)))
+        tried = []
+        try:
+            for label, ci in tries:
+                try:
+                    items = _items(self.media_pool.AppendToTimeline([ci]))
+                except Exception as ex:                         # noqa: BLE001
+                    tried.append("%s: %s" % (label, ex))
+                    continue
+                new = items[0] if items else None
+                got = "nothing" if new is None else "%s frame(s) at %s" % (new.GetDuration(), new.GetStart())
+                self.log("place as %s -> %s (want %d at %d)" % (label, got, n, info["start"]))
+                if new is not None and int(new.GetDuration()) == n and int(new.GetStart()) == info["start"]:
+                    return new, idx
+                tried.append("%s gave %s" % (label, got))
+                if new is not None:
+                    try:
+                        if not tl.DeleteClips([new], False):
+                            new.SetClipEnabled(False)
+                    except Exception:                           # noqa: BLE001
+                        new.SetClipEnabled(False)
+        finally:
+            if playhead:
+                try:
+                    tl.SetCurrentTimecode(playhead)
+                except Exception:                               # noqa: BLE001
+                    pass
+        raise GlitcherError("Resolve would not place the glitch as %d frames at frame %d (%s). The clip "
+                            "is in the Glitcher bin; drag it onto track V%d by hand, and please send "
+                            "the log." % (n, info["start"], "; ".join(tried), idx))
 
     def copy_transform(self, src, dst):
         keys = ("Pan", "Tilt", "ZoomX", "ZoomY", "ZoomGang", "RotationAngle", "AnchorPointX", "AnchorPointY",
@@ -553,11 +641,14 @@ def build_comp(comp, pass_first, n, log):
         grade.ConnectInput("Input", glow)
         grade.ConnectInput("EffectMask", matte)
         media_out.ConnectInput("Input", grade)
-        try:
-            note = add("Note", "GlitcherNote", 0, 2)
-            note.SetInput("Comments", NOTE_TEXT)
-        except Exception:                                       # noqa: BLE001 - a note is optional
-            pass
+        for tool, text in ((loader, "Glitcher: where the glitch is (white). Select and press 1 to view."),
+                           (matte, "Glitcher: raise Low to keep only the hard glitches."),
+                           (glow, "Glitcher: light from the glitch only (the pass is its Glow Mask)."),
+                           (grade, "Glitcher: colour of the glitch only.")):
+            try:
+                tool.SetInput("Comments", text)                 # shown when you hover the node
+            except Exception:                                   # noqa: BLE001 - cosmetic
+                pass
     finally:
         comp.Unlock()
     return {"loader": loader, "matte": matte, "glow": glow, "grade": grade}
@@ -572,6 +663,213 @@ def update_comp(comp, pass_first, n, log):
     set_loader(loader, pass_first, start, n, log)
     return True
 
+
+# =========================================================================== probe (contract)
+PROBE_W, PROBE_H, PROBE_N = 64, 36, 6
+
+
+def write_png(path, w, h, rgba):
+    """A tiny RGBA PNG with the standard library only (no NumPy / Pillow inside Resolve)."""
+    raw = b"".join(b"\x00" + bytes(rgba) * w for _ in range(h))
+
+    def chunk(kind, data):
+        c = kind + data
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def _safe(fn, *a):
+    try:
+        return fn(*a)
+    except Exception as ex:                                     # noqa: BLE001 - record, go on
+        return "ERROR %s: %s" % (type(ex).__name__, ex)
+
+
+def _call_items(fn, *a):
+    """(list of results, None) or ([], "ERROR ...") for an API call returning a Lua table."""
+    r = _safe(fn, *a)
+    if isinstance(r, str):
+        return [], r
+    return _items(r), None
+
+
+def _item_facts(it):
+    if it is None or isinstance(it, str):
+        return it
+    return {"start": _safe(it.GetStart), "duration": _safe(it.GetDuration), "end": _safe(it.GetEnd),
+            "left_offset": _safe(it.GetLeftOffset), "source_start": _safe(it.GetSourceStartFrame)}
+
+
+def probe(resolve, log=print, render=True, folder=None):
+    """Ask this Resolve, on a throwaway timeline, every question the plugin depends on, and
+    return the answers. Everything it creates is removed again. The report is the contract the
+    tests hold the fake Resolve to (tests/resolve_contract/)."""
+    pm = resolve.GetProjectManager()
+    project = pm.GetCurrentProject()
+    if not project:
+        raise GlitcherError("open a project first")
+    mp = project.GetMediaPool()
+    folder = folder or tempfile.mkdtemp(prefix="glitcher_probe_")
+    rep = {"probe": 1, "plugin": PLUGIN_VERSION, "python": sys.version.split()[0], "platform": sys.platform,
+           "resolve": {"version": _safe(lambda: resolve.GetVersionString()),
+                       "product": _safe(lambda: resolve.GetProductName())}}
+    seqs = {"small": ("probe_", 101, 4), "timecode": ("tc_", 90000, 8)}
+    for key, (prefix, first, digits) in seqs.items():
+        d = os.path.join(folder, key)
+        os.makedirs(d, exist_ok=True)
+        for i in range(PROBE_N):
+            write_png(os.path.join(d, "%s%0*d.png" % (prefix, digits, first + i)), PROBE_W, PROBE_H,
+                      (40 * i, 120, 200, 255 if i % 2 else 128))
+    old_tl = project.GetCurrentTimeline()
+    tl, made_clips, root = None, [], mp.GetRootFolder()
+    prev_folder = mp.GetCurrentFolder()
+    try:
+        bin_ = mp.AddSubFolder(root, "Glitcher probe")
+        mp.SetCurrentFolder(bin_)
+        imports = {}
+        clips = {}
+        for key, (prefix, first, digits) in seqs.items():
+            d = os.path.join(folder, key)
+            pat = os.path.join(d, prefix + "%0" + str(digits) + "d.png")
+            files = [os.path.join(d, "%s%0*d.png" % (prefix, digits, first + i)) for i in range(PROBE_N)]
+            for how, arg in (("pattern", [{"FilePath": pat, "StartIndex": first, "EndIndex": first + PROBE_N - 1}]),
+                             ("file_list", files)):
+                got, err = _call_items(mp.ImportMedia, arg)
+                if err:
+                    imports["%s/%s" % (key, how)] = err
+                    continue
+                made_clips += got
+                imports["%s/%s" % (key, how)] = {
+                    "clips": len(got),
+                    "props": {k: (got[0].GetClipProperty(k) if got else None)
+                              for k in ("Frames", "Start", "End", "Start TC", "File Path", "Type", "Format",
+                                        "Alpha mode", "Clip Name")}}
+                if got and how == "pattern":
+                    clips[key] = got[0]
+        rep["import"] = imports
+        log("probe: imports %s" % {k: (v["clips"], v["props"]["Frames"]) if isinstance(v, dict) else v
+                                   for k, v in imports.items()})
+        tl = mp.CreateEmptyTimeline("Glitcher probe %s" % time.strftime("%H%M%S"))
+        if not tl:
+            raise GlitcherError("could not create a probe timeline")
+        project.SetCurrentTimeline(tl)
+        t0 = int(_safe(tl.GetStartFrame) or 0)
+        rep["timeline_start"] = t0
+        places = {}
+        for key, clip in clips.items():
+            first = seqs[key][1]
+            variants = [("whole", {}), ("zero_based", {"startFrame": 0, "endFrame": PROBE_N - 1}),
+                        ("file_numbers", {"startFrame": first, "endFrame": first + PROBE_N - 1}),
+                        ("trim2_zero_based", {"startFrame": 2, "endFrame": PROBE_N - 1}),
+                        ("trim2_file_numbers", {"startFrame": first + 2, "endFrame": first + PROBE_N - 1})]
+            for name, extra in variants:
+                ci = dict({"mediaPoolItem": clip, "trackIndex": 1, "recordFrame": t0 + 10, "mediaType": 1}, **extra)
+                its, err = _call_items(mp.AppendToTimeline, [ci])
+                places["%s/%s" % (key, name)] = _item_facts(its[0]) if its else err
+                if its:
+                    _safe(tl.DeleteClips, its, False)
+        rep["place"] = places
+        log("probe: placements %s" % {k: (v or {}).get("duration") if isinstance(v, dict) else v
+                                      for k, v in places.items()})
+        # Fusion: what a new comp looks like and which inputs the nodes have
+        fus = {}
+        its, _err = _call_items(mp.AppendToTimeline, [{"mediaPoolItem": clips.get("small"), "trackIndex": 1,
+                                                       "recordFrame": t0, "mediaType": 1}])
+        item = its[0] if its else None
+        if item is not None:
+            comp = _safe(item.AddFusionComp)
+            if comp is not None and not isinstance(comp, str):
+                a = _safe(comp.GetAttrs) or {}
+                fus["render_start"] = a.get("COMPN_RenderStart") if isinstance(a, dict) else a
+                fus["render_end"] = a.get("COMPN_RenderEnd") if isinstance(a, dict) else a
+                fus["tools"] = sorted(str((t.GetAttrs() or {}).get("TOOLS_RegID"))
+                                      for t in _call_items(comp.GetToolList, False)[0])
+                fus["flowview"] = not isinstance(_safe(lambda: comp.CurrentFrame.FlowView.GetPosTable), str)
+                for kind in ("Loader", "BitmapMask", "Glow", "ColorCorrector"):
+                    t = _safe(comp.AddTool, kind, -32768, -32768)
+                    fus[kind] = (sorted(str((i.GetAttrs() or {}).get("INPS_ID"))
+                                        for i in _call_items(t.GetInputList)[0])
+                                 if t is not None and not isinstance(t, str) else t)
+                path = os.path.join(folder, "probe.comp")
+                fus["export_comp"] = _safe(item.ExportFusionComp, path, 1)
+                fus["export_file"] = os.path.isfile(path)
+            _safe(tl.DeleteClips, [item], False)
+        rep["fusion"] = fus
+        # tracks
+        rep["tracks"] = {"enabled_query": _safe(tl.GetIsTrackEnabled, "video", 1),
+                         "set_enable": _safe(tl.SetTrackEnable, "video", 1, True)}
+        # render: naming and range of an EXR render of 3 frames
+        if render and clips.get("small") is not None:
+            its, _err = _call_items(mp.AppendToTimeline, [{"mediaPoolItem": clips["small"], "trackIndex": 1,
+                                                           "recordFrame": t0 + 100, "mediaType": 1}])
+            if its:
+                sess = Session.__new__(Session)
+                sess.resolve, sess.log, sess.project, sess.timeline, sess.media_pool = resolve, log, project, tl, mp
+                target = os.path.join(folder, "render")
+                info = {"start": t0 + 100, "end": t0 + 103, "duration": 3, "track": 1}
+                os.makedirs(target, exist_ok=True)
+                try:
+                    sess.render_range(info, target, "r_", "subject")
+                    rep["render"] = {"ok": True}
+                except GlitcherError as ex:
+                    rep["render"] = {"ok": False, "error": str(ex)}
+                rep["render"]["files_written"] = sorted(os.listdir(target))
+                rep["render"]["raw_names"] = getattr(sess, "_last_raw_names", None)
+        log("probe: render %s" % rep.get("render"))
+    finally:
+        if tl is not None:
+            if old_tl:
+                _safe(project.SetCurrentTimeline, old_tl)
+            _safe(mp.DeleteTimelines, [tl])
+        if made_clips:
+            _safe(mp.DeleteClips, made_clips)
+        try:
+            for f in _items(root.GetSubFolderList()):
+                if f.GetName() == "Glitcher probe":
+                    _safe(mp.DeleteFolders, [f])
+        except Exception:                                       # noqa: BLE001
+            pass
+        if prev_folder:
+            _safe(mp.SetCurrentFolder, prev_folder)
+    return rep
+
+
+def contract(rep):
+    """The facts from a probe report that the plugin depends on (what the tests compare)."""
+    imp, pl, fu = rep.get("import", {}), rep.get("place", {}), rep.get("fusion", {})
+
+    def frames(k):
+        v = imp.get(k)
+        return (v.get("clips"), str((v.get("props") or {}).get("Frames"))) if isinstance(v, dict) else v
+
+    def dur(k):
+        v = pl.get(k)
+        return (v.get("duration"), v.get("left_offset"), v.get("source_start")) if isinstance(v, dict) else v
+    return {"import": {k: frames(k) for k in sorted(imp)},
+            "place": {k: dur(k) for k in sorted(pl)},
+            "start_property": {k: (v.get("props") or {}).get("Start") for k, v in sorted(imp.items())
+                               if isinstance(v, dict)},
+            "fusion_inputs": {k: sorted(set(fu.get(k) or []) & set(NEEDED_INPUTS.get(k, [])))
+                              for k in NEEDED_INPUTS},
+            "render": _render_contract(rep)}
+
+
+def _render_contract(rep):
+    """How Resolve names and counts an EXR sequence render of 3 frames from MarkIn."""
+    r = rep.get("render") or {}
+    names = r.get("raw_names") or []
+    if not names:
+        return r.get("error") or None
+    m = _SEQ.match(names[0])
+    markin = int(rep.get("timeline_start") or 0) + 100
+    return {"count": len(names), "digits": len(m.group(2)) if m else None,
+            "first_minus_markin": int(m.group(2)) - markin if m else None}
+
+
+NEEDED_INPUTS = {"Loader": ["Clip", "GlobalIn", "GlobalOut"], "BitmapMask": ["Image"],
+                 "Glow": ["Input", "EffectMask", "GlowMask"], "ColorCorrector": ["Input", "EffectMask"]}
 
 # =========================================================================== the round trip
 class Plugin(object):
@@ -710,14 +1008,14 @@ class Plugin(object):
         prev_folder = mp.GetCurrentFolder()
         mp.SetCurrentFolder(self.s._bin())
         try:
-            clip = self.s.import_sequence(glitch_files, "%s_glitch_%s" % (base, version))
+            clip, first_number = self.s.import_sequence(glitch_files, "%s_glitch_%s" % (base, version))
             if pass_files:
                 self.s.import_sequence(pass_files, "%s_glitchpass_%s" % (base, version))
         finally:
             if prev_folder:
                 mp.SetCurrentFolder(prev_folder)
         original = self.s.find_item(info["item_uid"])
-        new, track = self.s.place(clip, info, len(names))
+        new, track = self.s.place(clip, info, len(names), first_number)
         if job.get("source") == "files" and original is not None:
             self.s.copy_transform(original, new)               # media at source size: same framing
         # the comp: carry over the last version's (with your tweaks), else build one
@@ -726,7 +1024,8 @@ class Plugin(object):
         comp_note = "no glitch pass, so no comp"
         if pass_files:
             comp = None
-            if old_item is not None and int(old_item.GetFusionCompCount() or 0):
+            healthy = old_item is not None and int(old_item.GetDuration() or 0) == len(names)
+            if healthy and int(old_item.GetFusionCompCount() or 0):     # never copy a broken one
                 path = os.path.join(folder, "comp_%s.comp" % prev["version"])
                 try:
                     if old_item.ExportFusionComp(path, 1):
@@ -812,6 +1111,8 @@ class Panel(object):
                 ui.HGroup({"Weight": 0}, [ui.Button({"ID": "Editor", "Text": "Open in Glitcher editor"}),
                                           ui.Button({"ID": "Render", "Text": "Render"}),
                                           ui.Button({"ID": "Import", "Text": "Import latest"})]),
+                ui.HGroup({"Weight": 0}, [ui.Button({"ID": "Probe", "Text": "Check this Resolve (for bug reports)",
+                                                     "Weight": 0})]),
                 ui.Label({"ID": "Status", "Text": "", "Weight": 0, "WordWrap": True}),
                 ui.TextEdit({"ID": "Log", "ReadOnly": True}),
             ]))
@@ -833,6 +1134,7 @@ class Panel(object):
         on.Render.Clicked = lambda ev: self.guard(self.render)
         on.Import.Clicked = lambda ev: self.guard(self.do_import)
         on.LoadPreset.Clicked = lambda ev: self.guard(self.load_preset)
+        on.Probe.Clicked = lambda ev: self.guard(self.run_probe)
         self.timer = None
         try:                                                    # polls Glitcher while it renders
             self.timer = ui.Timer({"ID": "GlitcherPoll", "Interval": 500})
@@ -851,6 +1153,13 @@ class Panel(object):
             self.it["Log"].Append(str(msg))
         except Exception:                                       # noqa: BLE001
             print(msg)
+        try:                                                    # a file you can send when stuck
+            path = os.path.join(cache_root(self.plugin.cfg if getattr(self, "plugin", None) else load_config()), "panel.log")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n")
+        except Exception:                                       # noqa: BLE001
+            pass
 
     def status(self, msg):
         self.it["Status"].Text = str(msg)
@@ -947,6 +1256,19 @@ class Panel(object):
         copy_preset(path, folder)
         self.it["Preset"].Text = "Look: " + os.path.basename(path)
         self.refresh()
+
+    def run_probe(self):
+        """Ask Resolve the questions the plugin relies on, on a throwaway timeline, and save the
+        answers: resolve_probe.json in the Glitcher Resolve folder. Send that file with a bug."""
+        self.status("checking Resolve (a throwaway timeline, a few seconds)...")
+        rep = probe(self.plugin.s.resolve, log=self.log)
+        rep["contract"] = contract(rep)
+        path = os.path.join(cache_root(self.plugin.cfg), "resolve_probe.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rep, f, indent=2, default=str)
+        self.status("saved %s - send it along with a bug report" % path)
+        self.log("probe saved: %s" % path)
 
     def close(self):
         if self.plugin and self.plugin.busy():

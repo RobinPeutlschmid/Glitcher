@@ -11,6 +11,9 @@ that built it. Not a pytest file: CI runs it after the build.
 3. --self-test: the editor window opens and its first preview renders.
 4. with --pose: --estimate-pose --check runs MediaPipe and finds the model inside the app,
    without downloading it.
+5. if Numba is installed here (so the build bundled it): the app renders with the compiled
+   kernels, they load from the disk cache the second time, and step 1 compares the app's
+   compiled render with a numpy render from the source code.
 Exit code 0 = all passed.
 """
 import argparse
@@ -25,11 +28,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parent), str(HERE)]
 
+os.environ["GLITCHER_NUMBA"] = "0"     # the reference renders below: numpy, the code it replaces
 import glitch  # noqa: E402
 import synth  # noqa: E402
 
 
 def run(cmd, timeout=600, env=None):
+    if env is None:            # the app picks its own render code (GLITCHER_NUMBA=0 is ours only)
+        env = {k: v for k, v in os.environ.items() if k != "GLITCHER_NUMBA"}
     t = time.time()
     r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                        encoding="utf-8", errors="replace", timeout=timeout, env=env)
@@ -65,6 +71,21 @@ def main() -> int:
             "--audio", str(wav), "--plate", str(plate), "--spill", "0.05",
             "--protect", "legs", "--landmarks", str(lm)]
 
+    import importlib.util
+    if importlib.util.find_spec("numba") is not None:
+        env = {k: v for k, v in os.environ.items() if k not in ("GLITCHER_NUMBA", "NUMBA_CACHE_DIR")}
+        env["LOCALAPPDATA"] = env["XDG_CACHE_HOME"] = str(work / "cache")       # a cold cache
+        stats = []
+        for _ in range(2):
+            r = run([exe, "--numba-check"], timeout=300, env=env)
+            try:
+                stats.append(json.loads(r.stdout.strip().splitlines()[-1]))
+            except (ValueError, IndexError):
+                stats.append({})
+        check(r.returncode == 0 and stats[0].get("backend") == "numba",
+              "the app renders with the compiled kernels (--numba-check)")
+        check(stats[1].get("from_cache") is True, "the compiled kernels load from the disk cache")
+
     r = run([exe, "--version"], timeout=120)
     check(r.returncode == 0 and (not r.stdout.strip() or glitch.__version__ in r.stdout),
           f"--version (expect {glitch.__version__})")
@@ -80,12 +101,16 @@ def main() -> int:
     got = sorted((work / "app").glob("*.png"))
     same = len(got) == 12 and all(synth.same_images(f, ref / f.name) for f in got)
     check(r.returncode == 0 and same, "--glitch render is bit-identical to the source code's")
+    if importlib.util.find_spec("numba") is not None:
+        check("render code: numba" in r.stderr, "... and the app rendered it with the compiled kernels")
 
     r = run([exe, "--glitch", frames, "-o", work / "exr", "--format", "exr", "--range", "0-1", "-s", "3"])
     check(r.returncode == 0 and len(list((work / "exr").glob("*.exr"))) == 2, "EXR output")
 
     r = run([exe, "--self-test", frames], timeout=240)
     check(r.returncode == 0, "editor opens and renders its first preview (--self-test)")
+    if importlib.util.find_spec("numba") is not None:
+        check("renders with numba" in r.stdout, "the preview worker uses the compiled kernels")
 
     # DaVinci Resolve: a job renders headless, and the plugin installs from the app
     jd = work / "job"

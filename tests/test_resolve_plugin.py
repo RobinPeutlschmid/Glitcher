@@ -305,3 +305,143 @@ def test_install_never_blocks_on_a_dialog(tmp_path, monkeypatch):
         monkeypatch.setattr(glitch_gui.sys, "platform", plat)
         assert glitch_gui.install_resolve(str(tmp_path / "S"), quiet=False) == 0
     assert shown == []
+
+
+def test_rendered_sequence_is_placed_full_length(tmp_path):
+    """The bug from the first real test: a sequence Resolve rendered is numbered by timeline
+    frames (src_00086523.exr...), and asking AppendToTimeline for frames 0..n-1 of it gave a
+    1-frame clip. The glitch must land at full length at the clip's position."""
+    n = 12
+    subj = tmp_path / "subj"
+    synth.make_frames(subj, n)
+    tl = R.Timeline(2)
+    item = R.TimelineItem("keyed", 3, 6, 2, None, comps=1)
+    tl.put(item)
+    tl.current = item
+    proj = R.Project(tl, {2: subj})
+    pl = G.Plugin(R.Resolve(proj), cfg(tmp_path), log=lambda m: None)
+    folder, job = pl.prepare(item)
+    assert job["frames"] == ["src_%04d.exr" % i for i in range(1, 7)]   # renumbered from 1
+    pl.render(folder, job)
+    assert wait(pl)[1] == 0
+    new = pl.import_latest(folder, G.read_job(folder))
+    assert new.duration == 6 and new.start == 3
+    assert [len(v) for k, v in sorted(tl.tracks.items())] == [0, 1, 1]   # no leftover 1-frame clip
+    assert tl.playhead == "01:00:00:00"                                  # put back
+
+
+def test_zero_based_resolve_still_works(tmp_path):
+    """If a Resolve numbers clips from 0 instead, the first try is wrong: it is removed and
+    the next convention used."""
+    res, proj, tl, item, seq = files_setup(tmp_path)
+    proj.media_pool.zero_based = True
+    logs = []
+    pl = G.Plugin(res, cfg(tmp_path), log=logs.append)
+    folder, job = pl.prepare(item)
+    pl.render(folder, job)
+    assert wait(pl)[1] == 0
+    new = pl.import_latest(folder, G.read_job(folder))
+    assert new.duration == 8 and len(tl.tracks[3]) == 1
+    assert any("place as whole clip -> 8 frame(s)" in m for m in logs)   # no numbers needed
+
+
+def test_broken_previous_comp_is_not_carried_over(tmp_path):
+    res, proj, tl, item, seq = files_setup(tmp_path)
+    pl = G.Plugin(res, cfg(tmp_path), log=lambda m: None)
+    folder, job = pl.prepare(item)
+    pl.render(folder, job)
+    assert wait(pl)[1] == 0
+    first = pl.import_latest(folder, G.read_job(folder))
+    first.duration = 1                                        # what the old bug left behind
+    folder, job = pl.prepare(item, intensity=0.3)
+    pl.render(folder, job)
+    assert wait(pl)[1] == 0
+    exported = []
+    first.ExportFusionComp = lambda path, i: exported.append(path) or True
+    second = pl.import_latest(folder, G.read_job(folder))
+    assert exported == [] and second.comps[0].FindTool("GlitchPass") is not None   # fresh comp
+
+
+def test_import_falls_back_to_a_file_list(tmp_path):
+    """If Resolve turns the sequence pattern into a single still, import the list of files
+    instead, and remove the still from the bin."""
+    res, proj, tl, item, seq = files_setup(tmp_path)
+    proj.media_pool.pattern_gives_still = True
+    logs = []
+    pl = G.Plugin(res, cfg(tmp_path), log=logs.append)
+    folder, job = pl.prepare(item)
+    pl.render(folder, job)
+    assert wait(pl)[1] == 0
+    new = pl.import_latest(folder, G.read_job(folder))
+    assert new.duration == 8
+    bin_ = proj.media_pool.root.subs[0]
+    assert [c.props["Frames"] for c in bin_.clips] == ["8", "8"]          # glitch + pass, no still
+    assert any("import as list of 8 files" in m for m in logs)
+
+
+def test_placement_with_frame_numbers_when_whole_clip_fails(tmp_path):
+    res, proj, tl, item, seq = files_setup(tmp_path)
+    proj.media_pool.whole_clip_gives_one = True
+    logs = []
+    pl = G.Plugin(res, cfg(tmp_path), log=logs.append)
+    folder, job = pl.prepare(item)
+    pl.render(folder, job)
+    assert wait(pl)[1] == 0
+    new = pl.import_latest(folder, G.read_job(folder))
+    assert new.duration == 8 and len(tl.tracks[3]) == 1                 # the 1-frame try is gone
+    assert any("place as frames 3-10 -> 8 frame(s)" in m for m in logs)
+
+
+def test_renumber_from_one(tmp_path):
+    d = tmp_path / "r"
+    d.mkdir()
+    for fr in (86523, 86524, 86525):
+        (d / f"src_{fr:08d}.exr").write_text(str(fr))
+    seq = G.renumber(G.scan_sequence(str(d)), "src_")
+    assert [os.path.basename(f) for f in seq["files"]] == ["src_0001.exr", "src_0002.exr", "src_0003.exr"]
+    assert (d / "src_0002.exr").read_text() == "86524"                   # order kept
+
+
+# ------------------------------------------------------------------ probe / contract
+CONTRACTS = sorted((ROOT / "tests" / "resolve_contract").glob("*.json"))
+
+
+def probe_fake(tmp_path):
+    tl = R.Timeline(2)
+    proj = R.Project(tl, {})
+    res = R.Resolve(proj)
+    rep = G.probe(res, log=lambda m: None, folder=str(tmp_path / "probe"))
+    return rep, proj, tl
+
+
+def test_probe_runs_and_cleans_up(tmp_path):
+    rep, proj, tl = probe_fake(tmp_path)
+    mp = proj.media_pool
+    assert proj.timeline is tl and mp.timelines == [tl]            # throwaway timeline is gone
+    assert [f.name for f in mp.root.subs] == [] and mp.root.clips == []
+    c = G.contract(rep)
+    assert c["import"]["small/pattern"] == (1, "6") and c["import"]["timecode/file_list"] == (1, "6")
+    assert c["place"]["small/whole"][0] == 6 and c["place"]["timecode/whole"][0] == 6
+    assert c["place"]["timecode/zero_based"][0] == 1               # what bit you: 1 frame
+    assert c["place"]["small/trim2_file_numbers"][:2] == (4, 2)
+    assert c["fusion_inputs"]["Glow"] == ["EffectMask", "GlowMask", "Input"]
+    assert c["render"] == {"count": 3, "digits": 8, "first_minus_markin": 0}
+    json.dumps(rep, default=str)                                    # the report can be saved
+
+
+@pytest.mark.parametrize("path", CONTRACTS, ids=[p.stem for p in CONTRACTS])
+def test_fake_matches_recorded_resolve(path, tmp_path):
+    real = json.loads(path.read_text(encoding="utf-8"))
+    fake = G.contract(probe_fake(tmp_path)[0])
+    want = real.get("contract") or G.contract(real)
+    diffs = {k: {"real": want[k], "fake": fake[k]} for k in want if k in fake and
+             json.loads(json.dumps(want[k])) != json.loads(json.dumps(fake[k]))}
+    assert not diffs, f"the fake Resolve disagrees with {path.name}: fix tests/fake_resolve.py\n" + \
+        json.dumps(diffs, indent=1)
+
+
+def test_no_recording_yet_is_visible():
+    """Until a real Resolve has been probed, say so in the test output (not silently)."""
+    if not CONTRACTS:
+        pytest.skip("no recorded Resolve contract yet: run 'Check this Resolve' in the panel and add "
+                    "resolve_probe.json to tests/resolve_contract/")

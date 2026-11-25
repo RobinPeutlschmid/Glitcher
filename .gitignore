@@ -17,3 +17,6 @@ glitcher/
 .pytest_cache/
 .venv/
 venv/
+
+# tools/gpu_bench.py output (send it, don't commit it)
+gpu_bench_result.json

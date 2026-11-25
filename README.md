@@ -1,7 +1,7 @@
 # Glitcher
 
-[![build](https://github.com/RobinPeutlschmid/Glitcher/actions/workflows/build.yml/badge.svg)](https://github.com/RobinPeutlschmid/Glitcher/actions/workflows/build.yml)
-[![latest release](https://img.shields.io/github/v/release/RobinPeutlschmid/Glitcher)](https://github.com/RobinPeutlschmid/Glitcher/releases/latest)
+[![build](https://github.com/YOUR-NAME/glitcher/actions/workflows/build.yml/badge.svg)](https://github.com/YOUR-NAME/glitcher/actions/workflows/build.yml)
+[![latest release](https://img.shields.io/github/v/release/YOUR-NAME/glitcher)](https://github.com/YOUR-NAME/glitcher/releases/latest)
 
 **"Digital hallucination" glitch for VFX: transparent cut-outs and image sequences in, temporally
 coherent, re-renderable glitch out.**
@@ -89,6 +89,7 @@ missing when you use a feature that needs it:
 | `miniaudio` | MP3 / FLAC / OGG audio and in-app playback (WAV works without it) |
 | `OpenEXR` | EXR input and output |
 | `mediapipe` | pose estimation (Pose tab, body-part landmarks) |
+| `numba` | compiled versions of the slowest loops: renders ~1.3-1.7x faster, identical frames. The first run on a machine compiles them (~10 s) and caches them. `GLITCHER_NUMBA=0` turns them off. There's no Intel Mac build of Numba |
 
 ## DaVinci Resolve plugin
 
@@ -121,7 +122,8 @@ MediaIn (glitch) ──> GlitchGlow ──> GlitchGrade ──> MediaOut
 GlitchPass (Loader) ──> PassMatte ────────┘
 ```
 
-Raise *Low* on PassMatte to keep only the hard glitches. GlitchGlow makes light come from the
+Hover a node for a one-line reminder of what it does. Raise *Low* on PassMatte to keep only
+the hard glitches. GlitchGlow makes light come from the
 glitch only, and the halo can still spread beyond it. GlitchGrade colours the glitch only.
 
 Each new version disables the previous one and copies its comp, tweaks included.
@@ -162,10 +164,14 @@ estimator. `estimate_pose.py --check` tests whether pose estimation works on thi
 |---|---|
 | `glitch.py` | the renderer and its command line |
 | `glitch_gui.py` | the editor |
+| `glitch_numba.py` | optional compiled (Numba) versions of the hottest loops in glitch.py |
 | `estimate_pose.py` | yaw / pitch / roll and body landmarks from footage (MediaPipe) |
 | `build_portable.py` | packages everything as an app that needs no Python |
 | `resolve/Glitcher.py` | the DaVinci Resolve plugin (installed into Resolve by the editor) |
 | `tests/` | pytest suite; makes its own synthetic footage and audio |
+| `docs/TESTING.md` | how it's tested, measurements, known gaps |
+| `tools/memcheck.py` | memory over a long render, frame by frame |
+| `tools/gpu_bench.py` | profiles a render and benchmarks numpy / Numba / GPU versions of the hot spots |
 | `ci/release_notes.py` | release helper used by CI |
 | `.github/workflows/build.yml` | tests, builds and releases on GitHub Actions |
 | `CHANGELOG.md` | what changed in each version |
@@ -183,6 +189,13 @@ python -m pytest tests                # Linux server without a display: xvfb-run
 - **Building the app yourself:** run `python build_portable.py` (or add `--no-pose` for a much
   smaller build without MediaPipe) on the system you're building for. PyInstaller can't
   cross-compile. The zip lands in `dist/`.
+
+What the tests cover, the memory and performance measurements, and what is still not covered:
+**[docs/TESTING.md](docs/TESTING.md)**. `tools/memcheck.py` measures memory over a long render.
+
+**Found a Resolve bug?** In the Glitcher panel click **Check this Resolve** and attach the
+`resolve_probe.json` it saves. Copied into `tests/resolve_contract/`, it makes the tests hold
+the fake Resolve to how your Resolve really behaves.
 
 ### Continuous integration
 
@@ -221,4 +234,4 @@ seconds, before anything is built.
 Pose estimation uses Google's [MediaPipe](https://github.com/google-ai-edge/mediapipe) Pose
 Landmarker. Audio decoding and playback use [miniaudio](https://github.com/irmen/pyminiaudio).
 EXR support comes from the [OpenEXR](https://github.com/AcademySoftwareFoundation/openexr)
-Python bindings.
+Python bindings. The compiled kernels use [Numba](https://numba.pydata.org/).

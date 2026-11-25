@@ -8,3 +8,6 @@ OpenEXR>=3.2
 # optional - pose estimation (Pose tab, --only/--protect landmarks). MediaPipe has no wheel for
 # Intel Macs, so it is skipped there; everything else works.
 mediapipe>=0.10.14; sys_platform != "darwin" or platform_machine == "arm64"
+# optional - compiled kernels (glitch_numba.py): ~1.3x faster renders, identical frames.
+# Numba has no wheels for Intel Macs since 0.63, so it is skipped there (numpy renders).
+numba>=0.60; sys_platform != "darwin" or platform_machine == "arm64"
