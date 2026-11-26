@@ -26,7 +26,7 @@ import tempfile
 import time
 import zlib
 
-PLUGIN_VERSION = "1.7.0"
+PLUGIN_VERSION = "2.0.0"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".glitcher_resolve.json")
 IMG_EXTS = (".exr", ".png", ".tif", ".tiff")
 TRACK_NAME = "Glitcher"

@@ -6,7 +6,8 @@ that built it. Not a pytest file: CI runs it after the build.
     python tests/smoke_frozen.py dist/Glitcher.app/Contents/MacOS/Glitcher --pose
 
 1. --glitch renders a synthetic sequence (time effects, audio, plate, body parts) with worker
-   processes, and the frames are bit-identical to the same render from the source code here.
+   processes, and the frames are bit-identical to the same render from the source code here:
+   with the native engine (bundled unless --no-engine), and with the Python renderer.
 2. EXR output works (OpenEXR got bundled).
 3. --self-test: the editor window opens and its first preview renders.
 4. with --pose: --estimate-pose --check runs MediaPipe and finds the model inside the app,
@@ -49,6 +50,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("exe", type=Path, help="the packaged app's executable")
     ap.add_argument("--pose", action="store_true", help="the build includes pose estimation")
+    ap.add_argument("--no-engine", action="store_true", help="the build left out the native engine")
     args = ap.parse_args()
     exe = args.exe.resolve()
     if not exe.is_file():
@@ -90,26 +92,50 @@ def main() -> int:
     check(r.returncode == 0 and (not r.stdout.strip() or glitch.__version__ in r.stdout),
           f"--version (expect {glitch.__version__})")
 
-    r = run([exe, "--glitch", frames, "-o", work / "app", "-j", "2", *opts])
-    ref = work / "ref"
-    with open(os.devnull, "w") as null:
-        so, sys.stdout = sys.stdout, null
-        try:
-            glitch.main([str(frames), "-o", str(ref), "-j", "1", *opts])
-        finally:
-            sys.stdout = so
-    got = sorted((work / "app").glob("*.png"))
-    same = len(got) == 12 and all(synth.same_images(f, ref / f.name) for f in got)
-    check(r.returncode == 0 and same, "--glitch render is bit-identical to the source code's")
+    def reference(name, engine):
+        """The same render from the source code here, in this process, on `engine`."""
+        os.environ["GLITCHER_ENGINE"] = engine
+        glitch._NATIVE = None
+        ref = work / name
+        with open(os.devnull, "w") as null:
+            so, sys.stdout = sys.stdout, null
+            try:
+                glitch.main([str(frames), "-o", str(ref), "-j", "1", *opts])
+            finally:
+                sys.stdout = so
+        return ref
+
+    def same_as(app_dir, ref):
+        got = sorted(app_dir.glob("*.png"))
+        return len(got) == 12 and all(synth.same_images(f, ref / f.name) for f in got)
+
+    r = run([exe, "--engine-check"], timeout=120)
+    if args.no_engine:
+        check(r.returncode != 0, "built without the native engine: the app says so (--engine-check)")
+    else:
+        check(r.returncode == 0 and r.stdout.startswith("native"), "the app has the native engine (--engine-check)")
+        r = run([exe, "--glitch", frames, "-o", work / "app", "-j", "2", *opts])
+        same = same_as(work / "app", reference("ref", "native"))
+        check(r.returncode == 0 and same, "--glitch render is bit-identical to the source code's (native engine)")
+        check("render code: native" in r.stderr, "... and the app rendered it with the native engine")
+
+    env = {k: v for k, v in os.environ.items() if k != "GLITCHER_NUMBA"}
+    env["GLITCHER_ENGINE"] = "python"
+    r = run([exe, "--glitch", frames, "-o", work / "app_py", "-j", "2", *opts], env=env)
+    same = same_as(work / "app_py", reference("ref_py", "python"))
+    check(r.returncode == 0 and same, "--glitch render is bit-identical to the source code's (Python renderer)")
     if importlib.util.find_spec("numba") is not None:
         check("render code: numba" in r.stderr, "... and the app rendered it with the compiled kernels")
+    os.environ.pop("GLITCHER_ENGINE", None)          # from here on the app picks its renderer
 
     r = run([exe, "--glitch", frames, "-o", work / "exr", "--format", "exr", "--range", "0-1", "-s", "3"])
     check(r.returncode == 0 and len(list((work / "exr").glob("*.exr"))) == 2, "EXR output")
 
     r = run([exe, "--self-test", frames], timeout=240)
     check(r.returncode == 0, "editor opens and renders its first preview (--self-test)")
-    if importlib.util.find_spec("numba") is not None:
+    if not args.no_engine:
+        check("renders with native" in r.stdout, "the preview worker uses the native engine")
+    elif importlib.util.find_spec("numba") is not None:
         check("renders with numba" in r.stdout, "the preview worker uses the compiled kernels")
 
     # DaVinci Resolve: a job renders headless, and the plugin installs from the app

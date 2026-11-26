@@ -20,3 +20,7 @@ venv/
 
 # tools/gpu_bench.py output (send it, don't commit it)
 gpu_bench_result.json
+
+# Rust build output (engine/)
+engine/target/
+compare_native.png

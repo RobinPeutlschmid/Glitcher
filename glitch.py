@@ -190,8 +190,9 @@ from __future__ import annotations
 import argparse
 import copy
 
-__version__ = "1.7.0"
+__version__ = "2.0.0"
 APP_NAME = "Glitcher"
+PROJECT_URL = "https://github.com/RobinPeutlschmid/Glitcher"   # downloads: PROJECT_URL + "/releases/latest"
 import glob as _glob
 import json
 import math
@@ -321,6 +322,71 @@ def numpy_worker_init():
     """Initializer for worker processes that should stay on numpy (the editor's playback)."""
     global _FAST, FAST_STATUS
     _FAST, FAST_STATUS = False, "numpy (playback worker)"
+    set_engine_threads(1)                           # a playback worker per core: one thread each
+    global NATIVE_HISTORY_BYTES
+    NATIVE_HISTORY_BYTES = 150_000_000              # ... and many of them: a smaller frame cache
+
+
+# --------------------------------------------------------------------------- renderer
+# Since 2.0 the frames are rendered by the native engine (engine/, glitch_core) when its
+# library is found: the same planner, files and options, about 10x faster. GLITCHER_ENGINE:
+# auto (default: native if it loads, else this file), python (always this file), native
+# (native or an error). The two renderers make the same kind of look, not the same pixels.
+_NATIVE = None        # the glitch_native module, or False
+
+
+def native():
+    """The glitch_native module if frames are rendered natively here, else None."""
+    global _NATIVE
+    if _NATIVE is None:
+        want = os.environ.get("GLITCHER_ENGINE", "auto").strip().lower()
+        _NATIVE = False
+        if want not in ("python", "py", "numpy", "off", "0"):
+            why = ""
+            try:
+                import glitch_native as gn
+                if gn.available():
+                    _NATIVE = gn
+                else:
+                    why = gn.unavailable_reason()
+            except ImportError as ex:
+                why = str(ex)
+            if want == "native" and not _NATIVE:
+                raise RuntimeError(f"GLITCHER_ENGINE=native, but the native engine can't be loaded: {why}")
+    return _NATIVE or None
+
+
+def renderer() -> str:
+    """Which renderer this process uses, for logs and the About box."""
+    gn = native()
+    return f"native (glitch_core {gn.engine().version})" if gn else "python"
+
+
+# A mosh replays every frame since its event began, so the native engine asks for up to 24
+# earlier frames; loading them is then what takes the time. Its processes keep more decoded
+# frames (it runs few of them): ~24 at 1080p... 18 at 4K.
+NATIVE_HISTORY_BYTES = 600_000_000
+
+
+def render(img, t: float = 0.0, **kw):
+    """glitch() on whichever renderer this process uses (see native())."""
+    gn = native()
+    if gn:
+        SeqHistory.BUDGET = max(SeqHistory.BUDGET, NATIVE_HISTORY_BYTES)
+        return gn.glitch(img, t, **kw)
+    return glitch(img, t, **kw)
+
+
+def warm_renderer() -> str:
+    """Load this process's renderer (the native library, else the compiled kernels); -> which."""
+    if native():
+        return renderer()
+    return warm_fast()
+
+
+def set_engine_threads(n: int):
+    """Threads for the native engine in this process; only works before its first frame."""
+    os.environ["RAYON_NUM_THREADS"] = str(max(1, int(n)))
 
 
 def _c(a):
@@ -2069,9 +2135,12 @@ class Landmarks:
     track is lightly smoothed (MediaPipe jitters a few pixels frame to frame)."""
 
     def __init__(self, path):
-        with np.load(path, allow_pickle=False) as z:
-            fr = np.asarray(z["frames"], np.float64)
-            lm = np.asarray(z["lm"], np.float64)
+        if str(path).lower().endswith(".csv"):
+            fr, lm = self._read_csv(path)
+        else:
+            with np.load(path, allow_pickle=False) as z:
+                fr = np.asarray(z["frames"], np.float64)
+                lm = np.asarray(z["lm"], np.float64)
         if lm.ndim != 3 or lm.shape[1] < 33 or len(fr) != len(lm):
             raise ValueError(f"{path}: not a landmarks file from estimate_pose.py")
         ok = np.isfinite(lm[:, 0, 0])
@@ -2083,6 +2152,22 @@ class Landmarks:
             sm[1:-1, :, :2] = (lm[:-2, :, :2] + 2 * lm[1:-1, :, :2] + lm[2:, :, :2]) / 4
             lm = sm
         self.frames, self.lm = fr, lm
+
+    @staticmethod
+    def _read_csv(path):
+        """estimate_pose.py's _landmarks.csv (the same data as the .npz, as text)."""
+        fr, lm = [], []
+        for ln in Path(path).read_text(encoding="utf-8-sig").splitlines():
+            ln = ln.split("#")[0].strip()
+            if not ln or ln.lower().startswith(("size", "frame")):
+                continue
+            v = [float(x) if x.strip() else math.nan for x in ln.split(",")]
+            row = (v[1:] + [math.nan] * 99)[:99]
+            fr.append(v[0])
+            lm.append(np.asarray(row, np.float64).reshape(33, 3))
+        if not fr:
+            raise ValueError(f"{path}: no landmark rows")
+        return np.asarray(fr, np.float64), np.stack(lm)
 
     def at(self, frame: float) -> np.ndarray:
         """(33, 3) at this frame number, interpolated between known frames, held beyond them."""
@@ -2978,7 +3063,7 @@ def _render(job):
     prev_frames = fo.pop("prev_frames", None)
     H, W = (img.shape[:2] if isinstance(img, np.ndarray) else (img.height, img.width))
     plate = load_plate(plate_path, io, img, (W, H)) if plate_path else None
-    out = glitch(img, t=frame / kw["fps"], frame=frame, bbox=bbox, yaw=yaw, pitch=pitch,
+    out = render(img, t=frame / kw["fps"], frame=frame, bbox=bbox, yaw=yaw, pitch=pitch,
                  roll=roll, cam_dist=camd, plate=plate,
                  history=SeqHistory(prev, io, plates=prev_plates, frames=prev_frames) if prev else None,
                  history_key=(str(src), None, str(plate_path) if plate_path else None), **{**kw, **fo})
@@ -3062,9 +3147,12 @@ class RenderCrash(RuntimeError):
     """A worker process died even when rendering alone: a crash, not a lack of memory."""
 
 
-def _worker_init(crash_log):
-    """Each worker writes a Python trace to crash_log if it dies of a native crash."""
+def _worker_init(crash_log, threads=None):
+    """Each worker writes a Python trace to crash_log if it dies of a native crash; threads:
+    the native engine's threads in this worker."""
     import faulthandler
+    if threads:
+        set_engine_threads(threads)
     try:
         faulthandler.enable(open(crash_log, "a", encoding="utf-8"))   # noqa: SIM115 - lives with the process
     except OSError:
@@ -3102,6 +3190,16 @@ def render_pool(work, workers: int, progress=None, cancel=None, log=None, chunk_
     the worker's trace). Frames are independent, so a retry gives the same pixels.
     chunk_fn replaces the per-worker function (tests use it to kill workers on purpose)."""
     log = log or (lambda m: print(m, file=sys.stderr))
+    threads, ctx = None, None
+    if chunk_fn is None and native():
+        # The engine is multithreaded itself: a few workers (file reading and writing overlap)
+        # sharing the cores, rather than one per core. Fresh processes, not forked ones: a fork
+        # of a process whose engine threads have started would wait on threads it lacks.
+        cpus = os.cpu_count() or 1
+        workers = max(1, min(int(workers), max(1, cpus // 4)))
+        threads = max(1, cpus // workers)
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
     chunk_fn = chunk_fn or _render_chunk
     n = len(work)
     crash_log = os.path.join(tempfile.gettempdir(), f"glitcher_worker_{os.getpid()}.log")
@@ -3111,7 +3209,8 @@ def render_pool(work, workers: int, progress=None, cancel=None, log=None, chunk_
         while pending:
             ch = 1 if solo else max(1, min(8, -(-len(pending) // (workers * 3))))
             chunks = [pending[i:i + ch] for i in range(0, len(pending), ch)]
-            ex = ProcessPoolExecutor(workers, initializer=_worker_init, initargs=(crash_log,))
+            ex = ProcessPoolExecutor(workers, mp_context=ctx, initializer=_worker_init,
+                                     initargs=(crash_log, threads))
             futs = [(ex.submit(chunk_fn, [work[i] for i in c]), c) for c in chunks]
             broken = None
             try:
@@ -3177,7 +3276,8 @@ def _gather(inp: str):
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="glitch.py",
-        description="Temporally coherent glitch for transparent PNG cutouts / image sequences.")
+        description="Temporally coherent glitch for transparent PNG cutouts / image sequences.",
+        epilog=f"{APP_NAME} {__version__} - {PROJECT_URL} (downloads: {PROJECT_URL}/releases/latest)")
     ap.add_argument("--version", action="version", version=f"{APP_NAME} {__version__} (glitch.py)")
     ap.add_argument("input", help="PNG file, folder of frames, or quoted glob such as 'f_*.png'")
     ap.add_argument("-o", "--output", type=Path,
@@ -3659,8 +3759,14 @@ def main(argv=None) -> int:
         if tty:
             print(f"\r{i}/{n}", end="", file=sys.stderr, flush=True)
 
-    _fast()       # load (first time on a machine: compile) once here, so the workers just load
-    print(f"render code: {FAST_STATUS}", file=sys.stderr)
+    try:
+        native_on = native() is not None
+    except RuntimeError as ex:                  # GLITCHER_ENGINE=native without the library
+        print(f"error: {ex}", file=sys.stderr)
+        return 1
+    if not native_on:
+        _fast()   # load (first time on a machine: compile) once here, so the workers just load
+    print(f"render code: {renderer() if native_on else FAST_STATUS}", file=sys.stderr)
     if jobs > 1:
         px = canvas_px(work)
         fit = safe_workers(jobs, px)

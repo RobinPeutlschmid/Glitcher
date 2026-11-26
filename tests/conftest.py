@@ -11,6 +11,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import synth  # noqa: E402
 
+# Most of this suite checks glitch.py's own renderer (exact pixels, Numba = NumPy, memory, the
+# pool). It runs on that one unless a test asks for the native engine (test_app_native.py
+# does); inherited by the subprocesses the tests start.
+os.environ.setdefault("GLITCHER_ENGINE", "python")
+
 # Windows and macOS start worker processes with "spawn"; use it everywhere so a pickling or
 # import-order bug that only shows up there fails on Linux too.
 multiprocessing.set_start_method("spawn", force=True)

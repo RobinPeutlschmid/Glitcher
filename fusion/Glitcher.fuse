@@ -1,0 +1,975 @@
+--[[
+Glitcher.fuse - the Glitcher node for Fusion (Resolve's Fusion page or Fusion Studio).
+
+The pixels are processed by glitch_core (the native engine, engine/ in the Glitcher repo). This
+file only connects Fusion to it: it reads the controls, asks the engine which earlier frames it
+needs, fetches exactly those, and hands everything over as raw pointers (LuaJIT FFI). The engine
+has all of glitch.py's look: the thirteen effects (Echo, Stutter, Mosh read earlier frames of the
+input), 3D mode (planes around the body, from angles you set or animate and / or a pose file from
+estimate_pose.py), body parts (needs its _landmarks.csv) and a background plate (the Plate input:
+the subject is composited onto it and the glitch may damage it near the subject), hits, and
+appear / vanish transitions.
+
+Pose estimation (the "Pose estimation" group): press Estimate pose and play or scrub the
+render range once. The node stores the input frames, then runs estimate_pose.py (or the Glitcher
+app, which includes it with MediaPipe) in the background and fills in the pose and landmark
+files; press Reload pose when the Console says it's ready.
+
+Install: put this file and glitch_core.dll (macOS: libglitch_core.dylib) into Fusion's Fuses
+folder - on Windows %APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Fuses - and
+restart Resolve. The library is looked for: in the "Library" field, in the GLITCHER_CORE
+environment variable, then next to this file / in the Fuses folder.
+
+Takes 32-bit and 16-bit float images (Resolve plays back in 16-bit, scrubs in 32-bit) and
+16/8-bit integer ones; anything else passes through, with a line in the Console. Works best on a
+keyed subject with alpha: echoes and smears go *under* the subject. Pose and landmark files are
+looked up by frame number = the comp's frame + "Track frame offset" (if the shot starts later in
+the clip estimate_pose.py saw, enter that frame).
+]]
+
+PARTS = { "face", "head", "torso", "arms", "hands", "legs", "feet" }
+
+-- the effects, in the engine's (glitch.py's) order: id, label
+EFFECTS = {
+    { "Jpeg", "JPEG" }, { "Blocks", "Blocks" }, { "Slices", "Slices" }, { "Wave", "Wave" },
+    { "Sort", "Pixel sort" }, { "Smear", "Smear" }, { "Split", "RGB split" }, { "Tint", "Tint" },
+    { "Scanlines", "Scanlines" }, { "Noise", "Noise" }, { "Echo", "Echo" }, { "Stutter", "Stutter" },
+    { "Mosh", "Mosh" },
+}
+
+FuRegisterClass("Glitcher", CT_Tool, {
+    REGS_Category = "Glitcher",
+    REGS_OpIconString = "Glt",
+    REGS_OpDescription = "Digital-hallucination glitches (native engine)",
+    REG_NoMotionBlurCtrls = true,
+    REG_NoBlendCtrls = false,
+    REG_NoObjMatCtrls = true,
+    REG_OpNoMask = true,
+    -- the output changes with time even when the input doesn't (a held frame still glitches):
+    -- without this Fusion may reuse one rendered frame
+    REG_TimeVariant = true,
+})
+
+local function slider(name, id, default, lo, hi, integer, allow_lo, allow_hi)
+    return self:AddInput(name, id, {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = default,
+        INP_MinScale = lo,
+        INP_MaxScale = hi,
+        INP_MinAllowed = allow_lo or lo,
+        INP_MaxAllowed = allow_hi,
+        INP_Integer = integer or false,
+    })
+end
+
+local function checkbox(name, id, default, width)
+    return self:AddInput(name, id, {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = default or 0,
+        ICD_Width = width,
+    })
+end
+
+local function text(name, id, file_filter)
+    return self:AddInput(name, id, {
+        LINKID_DataType = "Text",
+        INPID_InputControl = file_filter and "FileControl" or "TextEditControl",
+        FCS_FilterString = file_filter,
+        TEC_Lines = 1,
+        INPS_DefaultText = "",                                -- Text inputs: not INP_Default
+    })
+end
+
+local function button(name, id, width)
+    return self:AddInput(name, id, { LINKID_DataType = "Number", INPID_InputControl = "ButtonControl",
+                                     INP_DoNotifyChanged = true, INP_External = false, ICD_Width = width })
+end
+
+local function hidden(id)
+    return self:AddInput(id, id, { LINKID_DataType = "Number", INPID_InputControl = "SliderControl",
+                                   INP_Default = 0, INP_Integer = true, INP_External = false, IC_Visible = false })
+end
+
+local function label(name, id)
+    return self:AddInput(name, id, { LINKID_DataType = "Text", INPID_InputControl = "LabelControl",
+                                     INP_External = false, INP_Passive = true })
+end
+
+-- a collapsible group of the inputs `make` adds (counted, so the group always fits)
+local function group(name, id, make)
+    local list = {}
+    make(function(f) list[#list + 1] = f end)
+    self:AddInput(name, id, { LINKID_DataType = "Number", INPID_InputControl = "LabelControl",
+                              INP_External = false, INP_Passive = true, LBLC_DropDownButton = true,
+                              LBLC_NumInputs = #list, LBLC_NestLevel = 1 })
+    for _, f in ipairs(list) do f() end
+end
+
+local CSV = "CSV files (*.csv)|*.csv|All Files (*.*)|*.*||"
+
+function Create()
+    InImage = self:AddInput("Input", "Input", { LINKID_DataType = "Image", LINK_Main = 1 })
+    InPlate = self:AddInput("Plate", "Plate", { LINKID_DataType = "Image", LINK_Main = 2, INP_Required = false })
+    OutImage = self:AddOutput("Output", "Output", { LINKID_DataType = "Image", LINK_Main = 1 })
+    OutMatte = self:AddOutput("Glitch matte", "GlitchMatte", { LINKID_DataType = "Image", LINK_Main = 2 })
+
+    InSeed = slider("Seed", "Seed", 0, 0, 9999, true)
+    InIntensity = slider("Intensity", "Intensity", 0.5, 0, 1)
+    InTempo = slider("Tempo", "Tempo", 1.0, 0.1, 3)
+    InDensity = slider("Density", "Density", 1.0, 0, 3)
+    InBursts = slider("Bursts", "Bursts", 0.5, 0, 1)
+
+    group("Timing and layout", "GroupLayout", function(add)
+        add(function() InShotFrames = text("Shot frames (first-last; filled in from the clip)", "ShotFrames") end)
+        add(function() InLayout = self:AddInput("Layout box", "LayoutBox", {
+            LINKID_DataType = "Number", INPID_InputControl = "ComboControl", INP_Default = 0, INP_Integer = true,
+            { CCS_AddString = "Automatic (like the app)" }, { CCS_AddString = "This frame's subject" },
+            { CCS_AddString = "Whole shot" }, { CCS_AddString = "Follow the subject" },
+        }) end)
+        add(function() InFollow = slider("Follow smoothing (s)", "FollowSmoothing", 0.4, 0, 3) end)
+        add(function() InBoxGrow = slider("Box grow", "BoxGrow", 0, 0, 1) end)
+        add(function() InMotion = slider("Motion-reactive", "Motion", 0, 0, 1) end)
+        add(function() InBtnRescan = button("Rescan shot", "LayoutRescan") end)
+        add(function() InHits = text("Hits (frame[:strength[:seconds]], ...)", "Hits") end)
+        add(function() InHitStrength = slider("Hit strength (for Add hit)", "HitStrength", 1, 0, 1) end)
+        add(function() InHitLen = slider("Hit length (s)", "HitLength", 0.5, 0.05, 3, false, 0.01) end)
+        add(function() InBtnAddHit = button("Add hit here", "HitAdd", 0.5) end)
+        add(function() InBtnDelHit = button("Remove hit here", "HitRemove", 0.5) end)
+        add(function() InAppear = text("Appear at (frame[:seconds], ...)", "Appear") end)
+        add(function() InVanish = text("Vanish at (frame[:seconds], ...)", "Vanish") end)
+        add(function() InTransLen = slider("Appear / vanish length (s)", "TransLength", 1.0, 0.1, 4, false, 0.01) end)
+        add(function() InBtnAppear = button("Appear here", "AppearAdd", 0.34) end)
+        add(function() InBtnVanish = button("Vanish here", "VanishAdd", 0.33) end)
+        add(function() InBtnDelTrans = button("Remove here", "TransRemove", 0.33) end)
+    end)
+    InLayoutScans = hidden("LayoutScans")
+    InNodeId = self:AddInput("NodeId", "NodeId", { LINKID_DataType = "Text", INPID_InputControl = "TextEditControl",
+                                                   INPS_DefaultText = "", INP_External = false, IC_Visible = false })
+
+    InGain = {}
+    group("Effects", "GroupEffects", function(add)
+        -- strength per effect, glitch.py's order (1 = default, 0 = off, up to 3)
+        for i, e in ipairs(EFFECTS) do
+            add(function() InGain[i - 1] = slider(e[2], "Gain" .. e[1], 1.0, 0, 3) end)
+        end
+        add(function() InTint = slider("Tint amount", "TintAmount", 0.0, 0, 1) end)
+        add(function() InQuality = slider("JPEG quality (0 = from intensity)", "Quality", 0, 0, 100, true) end)
+    end)
+
+    group("3D", "Group3D", function(add)
+        add(function() In3D = checkbox("3D mode", "Mode3D", 0, 0.5) end)
+        add(function() InShowPose = checkbox("Show pose (check)", "ShowPose", 0, 0.5) end)
+        add(function() InYaw = slider("Yaw (+ = front turns right)", "Yaw", 0, -180, 180, false, -1e6) end)
+        add(function() InPitch = slider("Pitch (+ = camera above)", "Pitch", 0, -90, 90, false, -1e6) end)
+        add(function() InRoll = slider("Roll (+ = clockwise)", "Roll", 0, -90, 90, false, -1e6) end)
+        add(function() InLock = slider("Lock to the turn", "Lock", 1.0, 0, 1) end)
+        add(function() InCamDist = slider("Camera distance (0 = pose file's, else 3)", "CamDist", 0, 0, 10) end)
+        add(function() InDepth = slider("Volume depth", "Depth", 0.35, 0, 1.5) end)
+        add(function() InTilt = slider("Tilted planes", "Tilt", 0.25, 0, 1) end)
+        add(function() InPose = text("Pose file (estimate_pose.py)", "PoseFile", CSV) end)
+        add(function() InPoseSmooth = slider("Pose smoothing (s)", "PoseSmooth", 0, 0, 2) end)
+        add(function() InNoPitch = checkbox("Ignore pose pitch", "NoPosePitch", 0, 0.5) end)
+        add(function() InNoRoll = checkbox("Ignore pose roll", "NoPoseRoll", 0, 0.5) end)
+        add(function() InUnwrap = checkbox("Unwrap yaw (tracker data)", "PoseUnwrap", 0, 0.5) end)
+        add(function() InNoScale = checkbox("Ignore pose scale", "NoPoseScale", 0, 0.5) end)
+    end)
+
+    InOnly, InProtect = {}, {}
+    group("Body parts", "GroupParts", function(add)
+        add(function() InLandmarks = text("Landmarks file (_landmarks.csv)", "LandmarksFile", CSV) end)
+        add(function() label("Glitch only (none = everywhere)", "OnlyLabel") end)
+        for i, p in ipairs(PARTS) do
+            add(function() InOnly[i] = checkbox(p, "Only_" .. p, 0, 0.25) end)
+        end
+        add(function() label("Keep clean", "ProtectLabel") end)
+        for i, p in ipairs(PARTS) do
+            add(function() InProtect[i] = checkbox(p, "Protect_" .. p, 0, 0.25) end)
+        end
+        add(function() InTargets = text("Per effect (e.g. mosh=head; jpeg=torso+arms)", "Targets") end)
+        add(function() InFeather = slider("Part edge softness", "Feather", 1.0, 0, 4) end)
+    end)
+
+    group("Plate", "GroupPlate", function(add)
+        add(function() InSpill = slider("Spill onto the plate", "Spill", 0.05, 0, 1) end)
+    end)
+
+    group("Pose estimation", "GroupPoseEstimation", function(add)
+        add(function() InEstimator = text("Estimator (Glitcher app or estimate_pose.py)", "PoseEstimator",
+                                          "All Files (*.*)|*.*||") end)
+        add(function() InPoseDir = text("Pose folder (empty = automatic)", "PoseFolder") end)
+        add(function() InVariant = self:AddInput("Model", "PoseModel", {
+            LINKID_DataType = "Number", INPID_InputControl = "ComboControl", INP_Default = 0, INP_Integer = true,
+            { CCS_AddString = "heavy (most accurate)" }, { CCS_AddString = "full" }, { CCS_AddString = "lite (fastest)" },
+        }) end)
+        add(function() InYawHints = text("Yaw hints (frame:deg, e.g. 0:0, 120:180)", "YawHints") end)
+        add(function() InPitchHints = text("Pitch hints (frame:deg)", "PitchHints") end)
+        add(function() InRollHints = text("Roll hints (frame:deg)", "RollHints") end)
+        add(function() InFocal = slider("Lens focal length, mm (0 = unknown)", "FocalMM", 0, 0, 200) end)
+        add(function() InSensor = slider("Sensor width, mm", "SensorMM", 36, 1, 70) end)
+        add(function() InCapSize = slider("Stored frame size (longest side)", "PoseFrameSize", 1280, 256, 4096, true, 64) end)
+        add(function() InLinear = checkbox("Input is linear light", "PoseLinear", 0) end)
+        add(function() InBtnEstimate = button("Estimate pose", "PoseEstimate", 0.34) end)
+        add(function() InBtnReload = button("Reload pose", "PoseReload", 0.33) end)
+        add(function() InBtnRestart = button("Start over", "PoseStartOver", 0.33) end)
+    end)
+    -- what the buttons set (hidden): a run number, the run that starts over, a reload count.
+    -- Inputs, not Lua variables: they reach the render, are saved with the comp, and a
+    -- change makes Fusion render again
+    InPoseRun = hidden("PoseRun")
+    InPoseRestart = hidden("PoseRestartRun")
+    InPoseReloads = hidden("PoseReloads")
+
+    group("Advanced", "GroupAdvanced", function(add)
+        add(function() InOffset = slider("Track frame offset", "TrackOffset", 0, -1000, 1000, true, -1e9) end)
+        add(function() InFPS = slider("Frame rate (0 = the comp's)", "FPS", 0, 0, 120) end)
+        add(function() InMakeMatte = checkbox("Glitch matte output", "MakeMatte", 1, 0.5) end)
+        add(function() InDebug = checkbox("Debug log", "DebugLog", 0, 0.5) end)
+        add(function() InLib = text("Library", "Library") end)
+    end)
+end
+
+local ffi = require("ffi")
+local ok_cdef = pcall(ffi.cdef, [[
+typedef struct { uint32_t abi; uint32_t seed; double intensity, fps, tempo, density, bursts, boost; double gains[13];
+                 double tint; int32_t quality; int32_t bleed;
+                 int32_t mode3d; int32_t pose_flags; double yaw, pitch, roll, lock, cam_dist, depth, tilt, pose_smooth,
+                 track_offset; const char* pose_path; const char* landmarks_path;
+                 uint32_t only; uint32_t protect; uint32_t targets[13]; uint32_t overlay; double feather; double spill;
+                 int32_t layout_mode; int32_t pad2_; double layout[4]; double box_grow; const char* hits; double hit_len;
+                 const char* appear; const char* vanish; double trans_len; double follow; double motion;
+                 int32_t reveal_set; int32_t reveal_idx; double reveal_set_q; const double* landmarks; } GcParams8;
+typedef struct { void* ptr; int32_t width; int32_t height; int64_t stride; int32_t format; int32_t reserved; } GcImage;
+typedef struct { double ms; int32_t echo, stutter, mosh, has_box; int32_t bbox[4]; int32_t frame_fx[10];
+                 int32_t flags; int32_t warn; int32_t has_view; int32_t pad_; double view[4]; double hit; int32_t reveal; int32_t pad3_; double reveal_q; double motion; int32_t layout_from; int32_t pad4_; } GcStats8;
+const char* gc_version(void);
+void gc_sizes(int32_t*);
+void* gc_engine_new(void);
+void gc_engine_free(void*);
+const char* gc_last_error(void*);
+int32_t gc_parse_targets(void*, const char*, uint32_t*);
+int32_t gc_needed(void*, const GcParams8*, int64_t, int32_t, int32_t, int32_t, int32_t*);
+int32_t gc_render(void*, const GcParams8*, int64_t, const GcImage*, const GcImage*, const GcImage*, const GcImage*, const GcImage*, GcStats8*);
+double gc_now_ms(void);
+int32_t gc_shot_open(void*, const char*, int64_t, int64_t, int64_t, int32_t, int32_t);
+int32_t gc_shot_missing(void*, int64_t*, int32_t);
+int32_t gc_shot_feed(void*, int64_t, const GcImage*);
+typedef struct { uint32_t abi; int32_t run, restart, max_side, linear, pad_; int64_t first, last;
+                 double fps, focal_mm, sensor_mm; const char *dir, *estimator, *variant, *yaw_hints, *pitch_hints,
+                 *roll_hints; } GcPoseJob;
+typedef struct { int32_t state, captured, total, progress; char message[512]; } GcPoseStatus;
+void gc_pose_sizes(int32_t*);
+int32_t gc_pose_request(void*, const GcPoseJob*);
+int32_t gc_pose_missing(void*, int64_t*, int32_t);
+int32_t gc_pose_feed(void*, int64_t, const GcImage*);
+int32_t gc_pose_status(void*, GcPoseStatus*);
+]])
+local GC_ABI = 8
+local MAX_BACK = 24
+
+local lib, lib_from, engine
+local said = {}
+
+local function once(key, msg)                                 -- one Console line per problem
+    if not said[key] then
+        said[key] = true
+        print("[Glitcher] " .. msg)
+    end
+end
+
+local function exists(p)
+    local f = p and p ~= "" and io.open(p, "rb")
+    if f then f:close() return true end
+    return false
+end
+
+local function lib_name()
+    if ffi.os == "Windows" then return "glitch_core.dll" end
+    if ffi.os == "OSX" then return "libglitch_core.dylib" end
+    return "libglitch_core.so"
+end
+
+local function candidates(field)
+    local out = {}
+    local function add(p)
+        if p and p ~= "" then
+            p = tostring(p):gsub("^%s+", ""):gsub("%s+$", "")
+            out[#out + 1] = (p:gsub('^"(.*)"$', "%1"))
+        end
+    end
+    add(field)
+    add(os.getenv and os.getenv("GLITCHER_CORE"))
+    local src = debug and debug.getinfo and debug.getinfo(1, "S").source or ""
+    local dir = src:match("^@(.*[/\\])")
+    if dir then add(dir .. lib_name()) end
+    local okM, mapped = pcall(function() return self.Comp:MapPath("Fuses:" .. lib_name()) end)
+    if okM then add(mapped) end
+    return out
+end
+
+-- nil if the library's structs match this file's declarations, else what's wrong
+local function layout_problem(l)
+    local sz = ffi.new("int32_t[3]")
+    if not pcall(function() l.gc_sizes(sz) end) or not pcall(function() return l.gc_pose_sizes end) then
+        return "too old for this Glitcher.fuse: use the glitch_core built with it"
+    end
+    local want = { ffi.sizeof("GcParams8"), ffi.sizeof("GcImage"), ffi.sizeof("GcStats8") }
+    local got = { sz[0], sz[1], sz[2] }
+    l.gc_pose_sizes(sz)
+    want[4], want[5], got[4], got[5] = ffi.sizeof("GcPoseJob"), ffi.sizeof("GcPoseStatus"), sz[0], sz[1]
+    for i = 1, 5 do
+        if want[i] ~= got[i] then
+            return ("struct sizes %s, this node expects %s: library and Glitcher.fuse are from different versions")
+                :format(table.concat(got, "/"), table.concat(want, "/"))
+        end
+    end
+    return nil
+end
+
+local function get_lib(field)
+    for _, p in ipairs(candidates(field)) do
+        if p == lib_from and lib then return lib end
+        if exists(p) then
+            local okL, l = pcall(ffi.load, p)
+            if okL then
+                local bad = layout_problem(l)
+                if bad then okL, l = false, bad end
+            end
+            if okL then
+                lib, lib_from = l, p
+                engine = ffi.gc(lib.gc_engine_new(), lib.gc_engine_free)
+                print("[Glitcher] engine glitch_core " .. ffi.string(lib.gc_version()) .. " from " .. p)
+                return lib
+            end
+            once("load" .. p, "could not load " .. p .. ": " .. tostring(l))
+        end
+    end
+    return nil
+end
+
+local function addr(p) return tonumber(ffi.cast("uintptr_t", p)) end
+
+-- Pixel formats the engine takes (GcImage.format). Resolve's Fusion page hands a node 32-bit
+-- float frames when scrubbing and 16-bit float ones during playback (Depth 8 / 7).
+local F32, F16, U16, U8 = 0, 1, 2, 3
+local FMT_NAME = { [0] = "float32", "float16", "uint16", "uint8" }
+
+local function half_to_float(hb)                             -- IEEE binary16 -> number
+    local sign = hb >= 0x8000 and -1 or 1
+    local e = math.floor(hb / 1024) % 32
+    local m = hb % 1024
+    if e == 0 then return sign * m * 2 ^ -24 end
+    if e == 31 then return m == 0 and sign * math.huge or 0 / 0 end
+    return sign * (1 + m / 1024) * 2 ^ (e - 15)
+end
+
+local function decode(row, fmt, i)
+    if fmt == F32 then return ffi.cast("float*", row)[i] end
+    if fmt == F16 then return half_to_float(ffi.cast("uint16_t*", row)[i]) end
+    if fmt == U16 then return ffi.cast("uint16_t*", row)[i] / 65535 end
+    return ffi.cast("uint8_t*", row)[i] / 255
+end
+
+-- Which format a Depth code is, checked against GetPixel (2-byte channels could be float16 or
+-- uint16): decided once per Depth code, from pixels that aren't all zero.
+local fmt_by_depth = {}
+local function detect_format(img, rows, cs)
+    local cands = cs == 4 and { F32 } or cs == 2 and { F16, U16 } or cs == 1 and { U8 } or {}
+    if #cands <= 1 then return cands[1] end
+    local known = fmt_by_depth[img.Depth]
+    if known then return known end
+    local w, h = img.Width, img.Height
+    local p = Pixel()
+    local err, seen = {}, 0
+    for _, c in ipairs(cands) do err[c] = 0 end
+    for gy = 1, 9 do
+        for gx = 1, 9 do
+            local x, y = math.floor(gx * (w - 1) / 10), math.floor(gy * (h - 1) / 10)
+            img:GetPixel(x, y, p)
+            if p.R ~= 0 or p.G ~= 0 or p.B ~= 0 or p.A ~= 0 then
+                seen = seen + 1
+                for _, c in ipairs(cands) do
+                    local v = { decode(rows[y], c, 4 * x), decode(rows[y], c, 4 * x + 1),
+                                decode(rows[y], c, 4 * x + 2), decode(rows[y], c, 4 * x + 3) }
+                    err[c] = math.max(err[c], math.abs(v[1] - p.R), math.abs(v[2] - p.G),
+                                      math.abs(v[3] - p.B), math.abs(v[4] - p.A))
+                end
+            end
+        end
+    end
+    if seen == 0 then return F16 end                          -- nothing to tell them apart by: the likely one
+    local best = err[F16] <= err[U16] and F16 or U16
+    if err[best] < 2e-3 then
+        fmt_by_depth[img.Depth] = best
+        print(("[Glitcher] Depth %s = %s (checked against GetPixel)"):format(tostring(img.Depth), FMT_NAME[best]))
+    end
+    return best
+end
+
+-- The image's pixels as a GcImage: top row pointer, signed stride (in channel values) and
+-- format, if the rows are evenly spaced. Fusion: img:GetScanLine(y) returns a table of row
+-- pointers (row y = p[y], y = 0 at the bottom). Found by GlitcherProbe.fuse; see NOTES.md.
+local function gc_image(img, into)
+    local w, h = img.Width, img.Height
+    if not w or not h or w < 2 or h < 2 then return nil, "empty image" end
+    local okC, cs = pcall(function() return img:GetChanSize(CHAN_RED or 0) end)
+    if not okC or not cs then return nil, "unknown channel size" end
+    local okS, rows = pcall(function() return img:GetScanLine(0) end)
+    if not okS or rows == nil then return nil, "no row access" end
+    local top, below = rows[h - 1], rows[h - 2]
+    local step = addr(below) - addr(top)                      -- bytes from the top row to the next one down
+    if math.abs(step) < 4 * cs * w or step % cs ~= 0 then return nil, "unexpected row layout" end
+    if addr(rows[0]) - addr(top) ~= step * (h - 1) then return nil, "rows not evenly spaced" end
+    local fmt = detect_format(img, rows, cs)
+    if not fmt then return nil, ("%d-byte channels"):format(cs) end
+    into.ptr = top
+    into.width, into.height, into.stride, into.format = w, h, step / cs, fmt
+    return into
+end
+
+local P = ffi.new("GcParams8")
+local lags = ffi.new("int32_t[24]")
+local back = ffi.new("GcImage[24]")
+local cur_i, out_i, plate_i, stats = ffi.new("GcImage"), ffi.new("GcImage"), ffi.new("GcImage"), ffi.new("GcStats8")
+local targets_text, targets_ok = nil, true
+
+local function val(inp, req) return inp:GetValue(req).Value end
+local function on(inp, req) return val(inp, req) > 0.5 end
+local function path_of(inp, req)
+    local v = tostring(val(inp, req) or ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub('^"(.*)"$', "%1")
+    if v == "" then return nil end
+    local okM, mapped = pcall(function() return self.Comp:MapPath(v) end)     -- Comp:, Fuses: ... paths
+    return (okM and mapped and mapped ~= "") and mapped or v
+end
+local function part_bits(list, req)
+    local b = 0
+    for i = 1, #PARTS do
+        if on(list[i], req) then b = b + 2 ^ (i - 1) end
+    end
+    return b
+end
+
+local function comp_fps()
+    local okF, r = pcall(function() return self.Comp:GetPrefs("Comp.FrameFormat.Rate") end)
+    return (okF and tonumber(r) and tonumber(r) > 0) and tonumber(r) or 25
+end
+
+local function comp_start()
+    local okA, a = pcall(function() return self.Comp:GetAttrs() end)
+    return (okA and a and tonumber(a.COMPN_GlobalStart)) or 0
+end
+
+-- Debug log: one line per rendered frame, to the Console and to glitcher_node.log in the temp
+-- folder - what Fusion asked for, which earlier frames arrived, what the engine did.
+local log_file
+local function dlog(on, line)
+    if not on then return end
+    print("[Glitcher] " .. line)
+    if not log_file then
+        local dir = (os.getenv and (os.getenv("TEMP") or os.getenv("TMPDIR"))) or "/tmp"
+        log_file = io.open(dir .. package.config:sub(1, 1) .. "glitcher_node.log", "a")
+    end
+    if log_file then log_file:write(line, "\n"); log_file:flush() end
+end
+
+local REQ_FLAGS = { "IsPreCalc", "IsQuick", "IsInteractive", "IsNoData", "IsFailed", "IsProxy" }
+local function req_flags(req)
+    local out = {}
+    for _, m in ipairs(REQ_FLAGS) do
+        local okM, v = pcall(function() return req[m](req) end)
+        if okM and v then out[#out + 1] = m:sub(3) end
+    end
+    return #out > 0 and table.concat(out, ",") or "-"
+end
+
+local function img_desc(im)
+    if not im then return "nil" end
+    local okC, cs = pcall(function() return im:GetChanSize(CHAN_RED or 0) end)
+    -- its domain of definition: anything outside it is cut off by the tools downstream
+    local okD, dod = pcall(function()
+        local d = im.DataWindow
+        return d and ("%d,%d-%d,%d"):format(d.left, d.bottom, d.right, d.top) or "none"
+    end)
+    return ("%sx%s d%s c%s px%s dod=%s"):format(tostring(im.Width), tostring(im.Height), tostring(im.Depth),
+        okC and tostring(cs) or "?", tostring(im.ProxyScale), okD and dod or "?")
+end
+
+-- ------------------------------------------------------------------ pose estimation
+local SEP = package.config:sub(1, 1)
+local VARIANTS = { [0] = "heavy", "full", "lite" }
+
+local function trim(v) return (tostring(v or ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub('^"(.*)"$', "%1")) end
+
+local function pose_root()
+    local base
+    if ffi.os == "Windows" then
+        base = os.getenv("LOCALAPPDATA") or ((os.getenv("USERPROFILE") or "C:") .. "\\AppData\\Local")
+    elseif ffi.os == "OSX" then
+        base = (os.getenv("HOME") or "/tmp") .. "/Library/Caches"
+    else
+        base = os.getenv("XDG_CACHE_HOME") or ((os.getenv("HOME") or "/tmp") .. "/.cache")
+    end
+    return base .. SEP .. "Glitcher" .. SEP .. "pose"
+end
+
+-- a "frame[:...]" list in a text input: how far its nearest entry is from `time`
+local function list_items(inp, time)
+    local items = {}
+    for part in tostring(inp:GetSource(time).Value or ""):gmatch("[^,;%s]+") do
+        items[#items + 1] = { part = part, f = tonumber(part:match("^([^:]+)")) }
+    end
+    return items
+end
+
+local function list_dist(inp, time)
+    local d = 1e9
+    for _, it in ipairs(list_items(inp, time)) do
+        if it.f then d = math.min(d, math.abs(it.f - time)) end
+    end
+    return d
+end
+
+-- add `entry` at the playhead (replacing one on that frame), or remove the entry at or next to
+-- it (within `reach` frames, default 3); the list stays sorted
+local function edit_list(inp, time, entry, reach)
+    local f = math.floor((time or 0) + 0.5)
+    local items, nearest, nd = list_items(inp, time), nil, 1e9
+    for i, it in ipairs(items) do
+        if it.f and math.abs(it.f - f) < nd then nearest, nd = i, math.abs(it.f - f) end
+    end
+    if entry then
+        if nearest and nd < 0.5 then table.remove(items, nearest) end
+        items[#items + 1] = { part = entry, f = f }
+    elseif nearest and nd <= (reach or 3) then
+        table.remove(items, nearest)
+    end
+    table.sort(items, function(a, b) return (a.f or 0) < (b.f or 0) end)
+    local parts = {}
+    for _, it in ipairs(items) do parts[#parts + 1] = it.part end
+    inp:SetSource(Text(table.concat(parts, ", ")), 0)
+end
+
+-- The clip's frame range from the comp (its render range: in Resolve the yellow In / Out marks
+-- of the edited clip). The comp may not be reachable from every place a Fuse runs, so several
+-- ways are tried; nil (and what went wrong) if none works.
+local function comp_range()
+    local tried = {}
+    for _, get in ipairs({
+        function() return self.Comp end,
+        function() return comp end,
+        function() return fusion and fusion:GetCurrentComp() end,
+    }) do
+        local okC, c = pcall(get)
+        if okC and c then
+            local okA, a = pcall(function() return c:GetAttrs() end)
+            if okA and a then
+                local s, e = tonumber(a.COMPN_RenderStart), tonumber(a.COMPN_RenderEnd)
+                if not (s and e) then s, e = tonumber(a.COMPN_GlobalStart), tonumber(a.COMPN_GlobalEnd) end
+                if s and e and e >= s then return math.floor(s + 0.5), math.floor(e + 0.5) end
+                tried[#tried + 1] = "no frame range in the comp's attributes"
+            else
+                tried[#tried + 1] = "GetAttrs failed: " .. tostring(a)
+            end
+        end
+    end
+    return nil, nil, #tried > 0 and table.concat(tried, "; ") or "the comp isn't reachable here"
+end
+
+-- fill in Shot frames (if empty) and this node's id (if it has none) - from the UI side, where
+-- the comp is reachable and inputs can be set
+local function fill_in(time)
+    local okS, cur = pcall(function() return InShotFrames:GetSource(time).Value end)
+    if okS and trim(cur) == "" then
+        local a, b = comp_range()
+        if a then InShotFrames:SetSource(Text(("%d-%d"):format(a, b)), 0) end
+    end
+    local okI, id = pcall(function() return InNodeId:GetSource(time).Value end)
+    if okI and trim(id) == "" then
+        math.randomseed(os.time() + math.floor((os.clock() % 1) * 1e6))
+        InNodeId:SetSource(Text(("%x-%x"):format(os.time(), math.random(0, 0x7fffffff))), 0)
+    end
+end
+
+-- buttons (UI side): they only write inputs, the render does the work
+function NotifyChanged(inp, param, time)
+    pcall(fill_in, time)
+    if param == nil or param.Value ~= 1 then return end      -- a button is 1 only at the click
+    if inp == InBtnEstimate or inp == InBtnRestart then
+        local dir = trim(InPoseDir:GetSource(time).Value)
+        if dir == "" then
+            local name = tostring(self.Name or "Glitcher"):gsub("[^%w_-]", "_")
+            math.randomseed(os.time() + math.floor((os.clock() % 1) * 1e6))
+            dir = pose_root() .. SEP .. os.date("%Y%m%d-%H%M%S") .. ("-%04x-"):format(math.random(0, 0xffff)) .. name
+            InPoseDir:SetSource(Text(dir), 0)
+        end
+        InPose:SetSource(Text(dir .. SEP .. "pose.csv"), 0)
+        InLandmarks:SetSource(Text(dir .. SEP .. "pose_landmarks.csv"), 0)
+        In3D:SetSource(Number(1), 0)
+        local run = math.floor(InPoseRun:GetSource(time).Value + 0.5) + 1
+        if inp == InBtnRestart then InPoseRestart:SetSource(Number(run), 0) end
+        InPoseRun:SetSource(Number(run), 0)
+    elseif inp == InBtnReload then
+        InPoseReloads:SetSource(Number(math.floor(InPoseReloads:GetSource(time).Value + 0.5) + 1), 0)
+    elseif inp == InBtnRescan then
+        InLayoutScans:SetSource(Number(math.floor(InLayoutScans:GetSource(time).Value + 0.5) + 1), 0)
+    elseif inp == InBtnAddHit then
+        local st = InHitStrength:GetSource(time).Value
+        local f = math.floor((time or 0) + 0.5)
+        edit_list(InHits, time, (math.abs(st - 1) < 1e-6) and tostring(f) or ("%d:%.2f"):format(f, st))
+    elseif inp == InBtnDelHit then
+        edit_list(InHits, time, nil)
+    elseif inp == InBtnAppear or inp == InBtnVanish then
+        local f = tostring(math.floor((time or 0) + 0.5))
+        edit_list(inp == InBtnAppear and InAppear or InVanish, time, f)
+        -- one transition per frame: an appear here replaces a vanish here and the other way round
+        local other = inp == InBtnAppear and InVanish or InAppear
+        edit_list(other, time, nil, 0.5)
+    elseif inp == InBtnDelTrans then
+        -- the transition at or next to the playhead, whichever kind
+        local da, dv = list_dist(InAppear, time), list_dist(InVanish, time)
+        edit_list(da <= dv and InAppear or InVanish, time, nil)
+    end
+end
+
+local PJ = ffi.new("GcPoseJob")
+local PS = ffi.new("GcPoseStatus")
+local pose_missing = ffi.new("int64_t[64]")
+local pose_img = ffi.new("GcImage")
+local pose_said = { state = -1, step = -1, msg = "" }
+local POSE_BUDGET_MS = 250                                    -- per render, fetching missing frames
+
+local function find_estimator(req)
+    local v = path_of(InEstimator, req)
+    if v then return v end
+    local env = os.getenv and (os.getenv("GLITCHER_APP") or os.getenv("GLITCHER_ESTIMATOR"))
+    if env and env ~= "" then return env end
+    local src = debug and debug.getinfo and debug.getinfo(1, "S").source or ""
+    local dir = src:match("^@(.*[/\\])")
+    if dir then
+        for _, n in ipairs({ "estimate_pose.py", "Glitcher.exe", "Glitcher" }) do
+            if exists(dir .. n) then return dir .. n end
+        end
+    end
+    return ""
+end
+
+-- The shot's frames: the Shot frames field ("0-249"), else the comp's range. nil if neither.
+local function render_range(req)
+    local t = trim(val(InShotFrames, req))
+    if t ~= "" then
+        local a, b = t:match("^(%-?%d+)%s*[-:%.%s]+%s*(%-?%d+)$")
+        a, b = tonumber(a), tonumber(b)
+        if a and b and b >= a then return a, b end
+        once("shotframes" .. t, "Shot frames '" .. t .. "': expected first-last, e.g. 0-249")
+        return nil
+    end
+    local a, b, why = comp_range()
+    if a then return a, b end
+    once("norange", "couldn't read the clip's frame range (" .. tostring(why) .. "): change any control of the node "
+         .. "to fill in Shot frames, or type them (e.g. 0-249). Until then the layout uses this frame's box.")
+    return nil
+end
+
+-- the pose run, if the Estimate button asked for one: hand over this frame, fetch a few missing
+-- ones, report. Returns the run's state (0 = none).
+local function pose_tick(L, req, cur, frame)
+    local run = math.floor(val(InPoseRun, req) + 0.5)
+    if run <= 0 then return 0 end
+    local dir = path_of(InPoseDir, req)
+    if not dir then return 0 end
+    local first, last = render_range(req)
+    if not first then return 0 end
+    local est, variant = find_estimator(req), VARIANTS[math.floor(val(InVariant, req) + 0.5)] or "heavy"
+    local yh, ph, rh = tostring(val(InYawHints, req) or ""), tostring(val(InPitchHints, req) or ""),
+                       tostring(val(InRollHints, req) or "")
+    PJ.abi, PJ.run = GC_ABI, run
+    PJ.restart = (math.floor(val(InPoseRestart, req) + 0.5) == run) and 1 or 0
+    PJ.max_side, PJ.linear = math.floor(val(InCapSize, req) + 0.5), on(InLinear, req) and 1 or 0
+    PJ.first, PJ.last, PJ.fps = first, last, P.fps
+    PJ.focal_mm, PJ.sensor_mm = val(InFocal, req), val(InSensor, req)
+    PJ.dir, PJ.estimator, PJ.variant = dir, est, variant
+    PJ.yaw_hints, PJ.pitch_hints, PJ.roll_hints = yh, ph, rh
+    local st = L.gc_pose_request(engine, PJ)
+    if st < 0 then
+        once("posereq" .. ffi.string(L.gc_last_error(engine)), ffi.string(L.gc_last_error(engine)))
+        return 0
+    end
+    if st == 1 then
+        if cur then L.gc_pose_feed(engine, frame, cur) end
+        local t0 = L.gc_now_ms()
+        while L.gc_now_ms() - t0 < POSE_BUDGET_MS do
+            local n = L.gc_pose_missing(engine, pose_missing, 64)
+            if n == 0 then break end
+            for i = 0, n - 1 do
+                local f = tonumber(pose_missing[i])
+                local okP, im = pcall(function() return InImage:GetSource(f) end)
+                local got = okP and im and gc_image(im, pose_img)
+                L.gc_pose_feed(engine, f, got and pose_img or nil)
+                im = nil
+                collectgarbage()                              -- free the frame now, not later
+                if L.gc_now_ms() - t0 >= POSE_BUDGET_MS then break end
+            end
+        end
+    end
+    st = L.gc_pose_status(engine, PS)
+    local msg = ffi.string(PS.message)
+    local step = st == 1 and math.floor(10 * PS.captured / math.max(1, PS.total))
+              or st == 2 and math.floor(10 * PS.progress / math.max(1, PS.total)) or 0
+    if st ~= pose_said.state or step ~= pose_said.step or (st >= 3 and msg ~= pose_said.msg) then
+        pose_said.state, pose_said.step, pose_said.msg = st, step, msg
+        if st == 1 and PS.captured >= PS.total then
+            print(("[Glitcher] pose: all %d frames stored"):format(PS.total))
+        elseif st == 1 then
+            print(("[Glitcher] pose: storing frames %d/%d (frames %d-%d) - play or scrub the range to finish sooner")
+                :format(PS.captured, PS.total, first, last))
+        elseif st == 2 then
+            print("[Glitcher] pose: " .. msg)
+        elseif st == 3 then
+            print("[Glitcher] " .. msg .. " - press Reload pose")
+        elseif st == 4 then
+            print("[Glitcher] pose estimation failed: " .. msg)
+        end
+    end
+    return st
+end
+
+-- the whole shot's layout box: every frame of the render range scanned once (kept per node
+-- while Resolve runs), then used for every frame - as the app lays effects out
+local shot_missing = ffi.new("int64_t[256]")
+local shot_img = ffi.new("GcImage")
+local SHOT_MAX = 3000                                         -- frames; longer ranges: this frame's box
+
+-- layout box modes: 0 automatic (the app's: whole shot, or follow in 3D), 1 this frame's
+-- subject, 2 whole shot, 3 follow. Everything but 1 - and the motion-reactive glitch - needs
+-- the shot scan.
+local function layout_tick(L, req, cur, frame, w, h)
+    local mode = math.floor(val(InLayout, req) + 0.5)
+    local follow = 0
+    if mode == 3 or (mode == 0 and on(In3D, req)) then follow = val(InFollow, req) end
+    P.layout_mode, P.follow = (mode == 1) and 0 or 2, follow
+    P.motion = val(InMotion, req)
+    if mode == 1 and P.motion <= 0 then return end
+    local first, last = render_range(req)
+    if not first then P.layout_mode = 0; return end
+    if last - first + 1 > SHOT_MAX then
+        once("shotlong", ("layout: the shot has %d frames; set Shot frames to the shot to use the whole-shot box, "
+            .. "follow box or motion"):format(last - first + 1))
+        P.layout_mode = 0
+        return
+    end
+    -- shared by every copy of this node Resolve runs: keyed by its id (or name), restarted by
+    -- the Rescan count
+    local key = trim(val(InNodeId, req))
+    if key == "" then key = "name:" .. tostring(self.Name or "Glitcher") end
+    local left = L.gc_shot_open(engine, key, math.floor(val(InLayoutScans, req) + 0.5), first, last, w, h)
+    if left > 0 then
+        local t0 = L.gc_now_ms()
+        if frame >= first and frame <= last then L.gc_shot_feed(engine, frame, cur) end
+        while true do
+            local n = L.gc_shot_missing(engine, shot_missing, 256)
+            if n <= 0 then break end
+            for i = 0, n - 1 do
+                local f = tonumber(shot_missing[i])
+                local okP, im = pcall(function() return InImage:GetSource(f) end)
+                local got = okP and im and gc_image(im, shot_img)
+                L.gc_shot_feed(engine, f, got and shot_img or nil)
+                im = nil
+                if i % 8 == 7 then collectgarbage() end
+            end
+            collectgarbage()
+        end
+        print(("[Glitcher] layout: scanned frames %d-%d for the whole-shot box and motion in %.1f s")
+            :format(first, last, (L.gc_now_ms() - t0) / 1000))
+    end
+end
+
+-- set the output and an empty matte (paths that don't render)
+local function set_out(req, im)
+    OutImage:Set(req, im)
+    local blank = im
+    if im then
+        local okB, b = pcall(function()
+            local n = Image({ IMG_Like = im })
+            pcall(function() n:Fill(Pixel({ R = 0, G = 0, B = 0, A = 0 })) end)
+            return n
+        end)
+        if okB and b then blank = b end
+    end
+    OutMatte:Set(req, blank)
+end
+
+function Process(req)
+    local img = InImage:GetValue(req)
+    local dbg = InDebug:GetValue(req).Value > 0.5
+    local pimg0 = InPlate:GetValue(req)
+    -- a pre-calculation only wants the output's size and extent, not pixels
+    local okPC, pre = pcall(function() return req:IsPreCalc() end)
+    if okPC and pre then
+        local okN, empty = pcall(function() return Image({ IMG_Like = img, IMG_NoData = true }) end)
+        set_out(req, okN and empty or img)
+        return
+    end
+    if not ok_cdef then
+        once("cdef", "FFI declarations failed")
+        set_out(req, img)
+        return
+    end
+    local L = get_lib(InLib:GetValue(req).Value)
+    if not L then
+        once("nolib", "glitch_core not found - put " .. lib_name() .. " next to Glitcher.fuse or set the Library field")
+        set_out(req, img)
+        return
+    end
+    if not img then                                           -- nothing connected / nothing at this time
+        set_out(req, pimg0)
+        return
+    end
+    local cur, why = gc_image(img, cur_i)
+    if not cur then
+        once("fmt" .. why, "input passed through: " .. why)
+        dlog(dbg, ("t=%s flags=%s in=%s -> passed through: %s"):format(tostring(req.Time), req_flags(req), img_desc(img), why))
+        set_out(req, img)
+        return
+    end
+    local w, h = img.Width, img.Height
+
+    P.abi = GC_ABI
+    P.seed = math.floor(InSeed:GetValue(req).Value + 0.5)
+    P.intensity = InIntensity:GetValue(req).Value
+    P.tempo = InTempo:GetValue(req).Value
+    P.density = InDensity:GetValue(req).Value
+    P.bursts = InBursts:GetValue(req).Value
+    P.boost = 0
+    local f = InFPS:GetValue(req).Value
+    P.fps = (f and f > 0) and f or comp_fps()
+    for i = 0, 12 do P.gains[i] = InGain[i]:GetValue(req).Value end
+    P.tint = InTint:GetValue(req).Value
+    P.quality = math.floor(InQuality:GetValue(req).Value + 0.5)
+    P.bleed = -1
+    -- 3D
+    P.mode3d = on(In3D, req) and 1 or 0
+    P.yaw, P.pitch, P.roll = val(InYaw, req), val(InPitch, req), val(InRoll, req)
+    P.lock, P.cam_dist, P.depth, P.tilt = val(InLock, req), val(InCamDist, req), val(InDepth, req), val(InTilt, req)
+    P.pose_smooth = val(InPoseSmooth, req)
+    P.pose_flags = (on(InNoPitch, req) and 1 or 0) + (on(InNoRoll, req) and 2 or 0) + (on(InUnwrap, req) and 4 or 0)
+                 + (on(InNoScale, req) and 8 or 0)
+    P.track_offset = val(InOffset, req)
+    -- the strings stay referenced (locals) until gc_render returns
+    local pose_s, lm_s = path_of(InPose, req), path_of(InLandmarks, req)
+    P.pose_path, P.landmarks_path = pose_s, lm_s
+    if pose_s and P.mode3d == 0 then once("pose3d", "a pose file is set but 3D mode is off: it is not used") end
+    -- body parts
+    P.only, P.protect = part_bits(InOnly, req), part_bits(InProtect, req)
+    local tt = tostring(val(InTargets, req) or "")
+    if tt ~= targets_text then                              -- parsed by the engine, when it changes
+        targets_text = tt
+        targets_ok = L.gc_parse_targets(engine, tt, P.targets) == 0
+        if not targets_ok then
+            print("[Glitcher] Per effect: " .. ffi.string(L.gc_last_error(engine)))
+            for i = 0, 12 do P.targets[i] = 0 end
+        end
+    end
+    P.feather = val(InFeather, req)
+    P.overlay = on(InShowPose, req) and 1 or 0
+    P.spill = val(InSpill, req)
+
+    local frame = math.floor(req.Time + 0.5)
+    local _ = val(InPoseReloads, req)                         -- part of the inputs: Reload re-renders
+    local pose_state = pose_tick(L, req, cur, frame)
+    layout_tick(L, req, cur, frame, w, h)
+    P.box_grow = val(InBoxGrow, req)
+    local hits_s = tostring(val(InHits, req) or "")             -- referenced until gc_render returns
+    P.hits, P.hit_len = hits_s, val(InHitLen, req)
+    local appear_s, vanish_s = tostring(val(InAppear, req) or ""), tostring(val(InVanish, req) or "")
+    P.appear, P.vanish, P.trans_len = appear_s, vanish_s, val(InTransLen, req)
+    local max_back = math.max(0, math.min(MAX_BACK, frame - comp_start()))
+    local n = L.gc_needed(engine, P, frame, w, h, max_back, lags)
+    for k = 0, MAX_BACK - 1 do back[k].ptr = nil end
+    local keep = {}                                           -- keep fetched images alive until the render ends
+    local got = {}
+    for i = 0, n - 1 do
+        local k = lags[i]
+        local t0 = os.clock()
+        local okP, prev = pcall(function() return InImage:GetSource(req.Time - k) end)
+        local note
+        if not okP then
+            note = "error " .. tostring(prev)
+        elseif not prev then
+            note = "nil"
+        elseif prev.Width ~= w or prev.Height ~= h then
+            note = "size " .. img_desc(prev)
+        elseif gc_image(prev, back[k - 1]) then
+            keep[#keep + 1] = prev
+            note = "ok"
+        else
+            back[k - 1].ptr = nil
+            note = "format " .. img_desc(prev)
+        end
+        if dbg then got[#got + 1] = ("%d:%s(%.0fms)"):format(k, note, (os.clock() - t0) * 1000) end
+    end
+
+    -- the plate (optional input): any supported format; another size is resized by the engine
+    local pimg = InPlate:GetValue(req)
+    local plate = nil
+    if pimg then
+        local okP, why_p = gc_image(pimg, plate_i)
+        if okP then
+            plate = plate_i
+            keep[#keep + 1] = pimg
+        else
+            once("plate" .. tostring(why_p), "plate not used: " .. tostring(why_p))
+        end
+    end
+
+    local out = Image({ IMG_Like = img })
+    if not gc_image(out, out_i) then
+        once("outfmt", "could not address the output image; passing through")
+        set_out(req, img)
+        return
+    end
+    -- the glitch matte (second output): same size and format as the output
+    local matte, matte_i = nil, nil
+    if on(InMakeMatte, req) then
+        matte = Image({ IMG_Like = img })
+        matte_i = ffi.new("GcImage")
+        if not gc_image(matte, matte_i) then matte, matte_i = nil, nil end
+    end
+    local r = L.gc_render(engine, P, frame, cur, back, plate, out_i, matte_i, stats)
+    keep = nil
+    if r == 0 and stats.warn ~= 0 and not (pose_state == 1 or pose_state == 2) then
+        once("warn" .. ffi.string(L.gc_last_error(engine)), ffi.string(L.gc_last_error(engine)))
+    end
+    local ffx = {}
+    for i = 0, 9 do ffx[#ffx + 1] = tostring(stats.frame_fx[i]) end
+    local modes = {}
+    for bit, name in pairs({ [1] = "3d", [2] = "rolled", [4] = "plate", [8] = "parts" }) do
+        if math.floor(stats.flags / bit) % 2 == 1 then modes[#modes + 1] = name end
+    end
+    table.sort(modes)
+    dlog(dbg, ("t=%s flags=%s in=%s start=%s fps=%.3g max_back=%d need=%d [%s] track=%s hit=%.2f reveal=%s out=%s -> view=%s layout=%s motion=%.2f r=%d echo=%d stutter=%d mosh=%d frame=%s box=%s mode=%s warn=%d %.1fms")
+        :format(tostring(req.Time), req_flags(req), img_desc(img), tostring(comp_start()), P.fps, max_back, n,
+                table.concat(got, " "), tostring(frame + P.track_offset), stats.hit,
+                ({ [0] = "visible", "appearing", "vanishing", "hidden" })[stats.reveal] .. (((stats.reveal == 1 or stats.reveal == 2) and (" %.2f"):format(stats.reveal_q)) or ""),
+                img_desc(out),
+                stats.has_view ~= 0 and ("yaw %.1f pitch %.1f roll %.1f cam %.2f"):format(stats.view[0], stats.view[1], stats.view[2], stats.view[3]) or "2d",
+                ({ [0] = "frame", "given", "shot", "follow" })[stats.layout_from] or "?", stats.motion,
+                r, stats.echo, stats.stutter, stats.mosh,
+                table.concat(ffx, ","),
+                stats.has_box ~= 0 and ("%d,%d-%d,%d"):format(stats.bbox[0], stats.bbox[1], stats.bbox[2], stats.bbox[3]) or "none",
+                #modes > 0 and table.concat(modes, "+") or "2d", stats.warn, stats.ms))
+    if r ~= 0 then
+        once("render" .. r, "engine error " .. r .. "; passing through")
+        set_out(req, img)
+        return
+    end
+    OutImage:Set(req, out)
+    if matte and r == 0 then
+        OutMatte:Set(req, matte)
+    else
+        local blank = Image({ IMG_Like = img })
+        pcall(function() blank:Fill(Pixel({ R = 0, G = 0, B = 0, A = 0 })) end)
+        OutMatte:Set(req, blank)
+    end
+end

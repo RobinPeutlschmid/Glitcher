@@ -1,7 +1,7 @@
 # Glitcher
 
-[![build](https://github.com/YOUR-NAME/glitcher/actions/workflows/build.yml/badge.svg)](https://github.com/YOUR-NAME/glitcher/actions/workflows/build.yml)
-[![latest release](https://img.shields.io/github/v/release/YOUR-NAME/glitcher)](https://github.com/YOUR-NAME/glitcher/releases/latest)
+[![build](https://github.com/RobinPeutlschmid/Glitcher/actions/workflows/build.yml/badge.svg)](https://github.com/RobinPeutlschmid/Glitcher/actions/workflows/build.yml)
+[![latest release](https://img.shields.io/github/v/release/RobinPeutlschmid/Glitcher)](https://github.com/RobinPeutlschmid/Glitcher/releases/latest)
 
 **"Digital hallucination" glitch for VFX: transparent cut-outs and image sequences in, temporally
 coherent, re-renderable glitch out.**
@@ -16,6 +16,13 @@ the subject's motion or to a soundtrack.
 
 ## Features
 
+- **Native engine (2.0).** Frames are rendered by `glitch_core`, a multithreaded Rust engine,
+  in the editor's preview and playback, in renders and on the command line. Measured on 2
+  cores: about 3x faster than the Python renderer at 4K, 2x at HD; more cores help it more.
+  Without the engine Glitcher falls back to the Python renderer (see *Run from source*).
+- **A Fusion node.** The same engine as a node on Resolve's Fusion page and in Fusion Studio
+  (`fusion/`): live in the comp, with pose estimation, body parts, plates, hits, appear /
+  vanish, a follow box, motion-reactive timing and a glitch matte output.
 - **13 effects**, each with its own strength: `jpeg`, `blocks`, `slices`, `wave`, `sort`,
   `smear`, `split`, `tint`, `scanlines`, `noise`, plus the time effects `echo` (ghost trails),
   `stutter` (frame hold) and `mosh` (datamosh motion bleed).
@@ -50,15 +57,22 @@ the subject's motion or to a soundtrack.
 
 ## Download
 
-Get the app for your system from **[Releases](https://github.com/YOUR-NAME/glitcher/releases/latest)**.
-It needs no Python: unzip it and start **Glitcher**.
+Get the app for your system from the **[latest release](https://github.com/RobinPeutlschmid/Glitcher/releases/latest)**
+([all releases](https://github.com/RobinPeutlschmid/Glitcher/releases)). It needs no Python: unzip it and start **Glitcher**.
 
-| Zip | For |
+| Zip (on the [release page](https://github.com/RobinPeutlschmid/Glitcher/releases/latest)) | For |
 |---|---|
 | `Glitcher-<version>-windows-x64.zip` | Windows 10 / 11, 64-bit |
 | `Glitcher-<version>-macos-arm64.zip` | Apple Silicon Macs (M1 and later) |
 | `Glitcher-<version>-macos-x64-nopose.zip` | Intel Macs. Everything works except pose *estimation*, because MediaPipe has no Intel-Mac build. Pose files made elsewhere still work. |
 | `Glitcher-<version>-linux-x64.zip` | Linux with glibc 2.39+ (Ubuntu 24.04 or newer) |
+| `Glitcher-Fusion-<version>-windows-x64.zip` | the Fusion node for Resolve / Fusion Studio on Windows: `Glitcher.fuse` + `glitch_core.dll`; see [fusion/README.md](fusion/README.md) |
+| `Glitcher-Fusion-<version>-macos-arm64.zip` | the same for Apple Silicon Macs (`libglitch_core.dylib`) |
+| `Glitcher-Fusion-<version>-linux-x64.zip` | the same for Linux (`libglitch_core.so`) |
+
+Builds of the newest code, before it's released: open the newest green run under
+**[Actions → build](https://github.com/RobinPeutlschmid/Glitcher/actions/workflows/build.yml)** and download from its *Artifacts* (needs
+a GitHub login; kept for 14 days).
 
 The apps aren't code-signed, so the first start asks you to confirm:
 
@@ -71,25 +85,48 @@ The apps aren't code-signed, so the first start asks you to confirm:
 
 ## Run from source
 
-Python 3.10+ (CI uses 3.12).
+Python 3.10+ (CI uses 3.12). Numba needs a Python version it has a release for: check
+[numba.pydata.org](https://numba.pydata.org/) if `pip` can't find one for a brand-new Python.
 
 ```bash
-git clone https://github.com/YOUR-NAME/glitcher.git
-cd glitcher
+git clone https://github.com/RobinPeutlschmid/Glitcher.git
+cd Glitcher
 python -m pip install -r requirements.txt
 python glitch_gui.py                 # the editor
 python glitch_gui.py path/to/frames  # ...opened on a sequence
 ```
 
-Only **NumPy** and **Pillow** are required. The rest is optional, and the app says what's
-missing when you use a feature that needs it:
+Needed: **NumPy** and **Pillow** (it won't run without them) and **Numba** (it runs without
+it, but renders are much slower). `requirements.txt` installs all three. Numba compiles the
+slowest loops to machine code. The frames are identical with and without it, so it only
+changes speed: ~1.3-1.7x per frame at HD, more at 4K. The first run on a machine compiles
+them (~10 s) and caches them on disk; later runs load them in under a second. Check it's
+active with `python glitch_gui.py --numba-check`, or look for `render code: numba` in the
+command line's output. There are no Numba builds for **Intel Macs** (since 0.63), so there
+Glitcher renders with plain NumPy: the same frames, just slower. `GLITCHER_NUMBA=0` turns it
+off anywhere.
+
+**The native engine** (`engine/`, Rust) renders the frames when its library is there. Build it
+once with [Rust](https://rustup.rs) installed:
+
+```bash
+cd engine && cargo build --release && cd ..
+python glitch_gui.py --engine-check   # "native (glitch_core 2.0.0)" = the app renders with it
+```
+
+Without it everything still works on the Python renderer above, ~2-3x slower. The two
+renderers make the same kind of glitch from the same settings, but not the same pixels (each
+draws its own random events), so a shot started on one should be finished on the same one.
+`GLITCHER_ENGINE=python` forces the Python renderer, `GLITCHER_ENGINE=native` refuses to run
+without the engine; the command line prints which one it used (`render code: ...`).
+
+The rest is optional, and the app says what's missing when you use a feature that needs it:
 
 | Package | Adds |
 |---|---|
 | `miniaudio` | MP3 / FLAC / OGG audio and in-app playback (WAV works without it) |
 | `OpenEXR` | EXR input and output |
 | `mediapipe` | pose estimation (Pose tab, body-part landmarks) |
-| `numba` | compiled versions of the slowest loops: renders ~1.3-1.7x faster, identical frames. The first run on a machine compiles them (~10 s) and caches them. `GLITCHER_NUMBA=0` turns them off. There's no Intel Mac build of Numba |
 
 ## DaVinci Resolve plugin
 
@@ -162,10 +199,13 @@ estimator. `estimate_pose.py --check` tests whether pose estimation works on thi
 
 | Path | What it is |
 |---|---|
-| `glitch.py` | the renderer and its command line |
+| `glitch.py` | the planner, the Python renderer and the command line |
+| `glitch_native.py` | the native engine from Python: `glitch()` with glitch.py's arguments, rendered by `glitch_core` |
+| `engine/` | `glitch_core`, the native engine (Rust, C interface) used by the app and the Fusion node |
+| `fusion/` | the Fusion node (`Glitcher.fuse`), its docs and its tests against a stand-in of Fusion's API |
 | `glitch_gui.py` | the editor |
 | `glitch_numba.py` | optional compiled (Numba) versions of the hottest loops in glitch.py |
-| `estimate_pose.py` | yaw / pitch / roll and body landmarks from footage (MediaPipe) |
+| `estimate_pose.py` | yaw / pitch / roll and body landmarks from footage (MediaPipe); writes `<pose>.csv`, `<pose>_landmarks.npz` and the same landmarks as `<pose>_landmarks.csv` (for the Fusion node) |
 | `build_portable.py` | packages everything as an app that needs no Python |
 | `resolve/Glitcher.py` | the DaVinci Resolve plugin (installed into Resolve by the editor) |
 | `tests/` | pytest suite; makes its own synthetic footage and audio |
@@ -186,9 +226,15 @@ python -m pytest tests                # Linux server without a display: xvfb-run
 - **Pose tests** need the model. Set `GLITCHER_POSE_MODEL=/path/to/pose_landmarker_heavy.task`,
   or keep it in `~/.cache/estimate_pose/` from an earlier run. Without it those tests are
   skipped.
+- **Engine tests:** `cd engine && cargo test --release`. The Fusion node runs against a
+  stand-in of Fusion's API with LuaJIT: `luajit fusion/test_glitcher_mock.lua fusion/Glitcher.fuse
+  engine/target/release/libglitch_core.so`.
+- **Python tests** run on the Python renderer by default; `tests/test_app_native.py` covers
+  the app on the native engine (skipped if it isn't built, unless `GLITCHER_REQUIRE_NATIVE=1`).
 - **Building the app yourself:** run `python build_portable.py` (or add `--no-pose` for a much
   smaller build without MediaPipe) on the system you're building for. PyInstaller can't
-  cross-compile. The zip lands in `dist/`.
+  cross-compile. It bundles the engine, building it with cargo first if needed
+  (`--no-engine` leaves it out). The zip lands in `dist/`.
 
 What the tests cover, the memory and performance measurements, and what is still not covered:
 **[docs/TESTING.md](docs/TESTING.md)**. `tools/memcheck.py` measures memory over a long render.
@@ -201,14 +247,17 @@ the fake Resolve to how your Resolve really behaves.
 
 Every push and pull request runs `.github/workflows/build.yml`:
 
-1. **Tests** run on Windows, macOS (Apple Silicon and Intel) and Linux.
-2. **The portable app** is built on each system.
+1. **Tests** run on Windows, macOS (Apple Silicon and Intel) and Linux, after building the
+   native engine there. The engine's own tests and the Fusion node's run in a separate job,
+   which also packages the node with its library per system.
+2. **The portable app** is built on each system, with the engine inside.
 3. **The built app is checked**, not just the source:
-   - it renders a test sequence, which must be pixel-identical to the source code's render;
+   - it renders a test sequence with the engine and with the Python renderer, each of which
+     must be pixel-identical to the source code's render;
    - it opens the editor;
    - it writes EXR;
    - it estimates poses with the bundled model.
-4. **The zips** are kept for 14 days under the run's *Artifacts*.
+4. **The zips** are kept for 14 days under the run's *Artifacts* ([runs](https://github.com/RobinPeutlschmid/Glitcher/actions/workflows/build.yml)).
 
 CI installs the exact versions in `constraints.txt`, so a release can't change just because
 a dependency did. Update them deliberately and let CI confirm.
@@ -221,11 +270,13 @@ a dependency did. Update them deliberately and let CI confirm.
 3. Tag the release and push the tag:
 
    ```bash
-   git tag v1.3.0
-   git push origin v1.3.0
+   git tag v2.0.0
+   git push origin v2.0.0
    ```
 
-CI then publishes the **Glitcher 1.3.0** release with the four zips, `SHA256SUMS.txt`, and
+   `engine/Cargo.toml` and `resolve/Glitcher.py` carry the same version; the tests check both.
+
+CI then publishes the **Glitcher 2.0.0** release on the [Releases page](https://github.com/RobinPeutlschmid/Glitcher/releases) with the app zips, the Fusion zips, `SHA256SUMS.txt`, and
 that CHANGELOG entry as the release notes. A tag that doesn't match `__version__` fails in
 seconds, before anything is built.
 

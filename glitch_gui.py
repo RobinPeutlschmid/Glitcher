@@ -293,7 +293,7 @@ def preview_job(job, scale: float):
     bleed = kw.get("bleed")
     kw2 = dict(kw, **fo)
     kw2.update(bleed=None if bleed is None else max(0, int(round(bleed * scale))), trim=False)
-    out = glitch.glitch(img, t=frame / kw["fps"], frame=frame, bbox=bbox, yaw=yaw,
+    out = glitch.render(img, t=frame / kw["fps"], frame=frame, bbox=bbox, yaw=yaw,
                         pitch=pitch, roll=roll, cam_dist=camd, history=hist,
                         history_key=(str(src), size, str(plate_path) if plate_path else None),
                         plate=plate, **kw2)
@@ -558,9 +558,9 @@ class App:
         self._restoring = False
         self.live_pool = _new_pool("live_pool")
         self.play_pool = _new_pool("play_pool")
-        # load the compiled kernels in the preview worker now (the first time on a machine this
-        # compiles them, ~10 s, and caches them on disk for every later worker)
-        self.render_code = self.live_pool.submit(glitch.warm_fast)
+        # load the renderer in the preview worker now: the native engine, or without it the
+        # compiled kernels (the first time on a machine those compile, ~10 s, cached on disk)
+        self.render_code = self.live_pool.submit(glitch.warm_renderer)
 
         self.vars: dict[str, tk.Variable] = {}
         prefs = _load_prefs()
@@ -3188,9 +3188,13 @@ def main():
     # the command-line modes below print progress, so give them a sink instead of crashing.
     global _NO_CONSOLE
     _NO_CONSOLE = sys.stdout is None
+    # GLITCHER_LOG: a host that started us (the Fusion node runs --estimate-pose) reads progress
+    # and errors from that file
+    log = os.environ.get("GLITCHER_LOG")
     for name in ("stdout", "stderr"):
         if getattr(sys, name) is None:
-            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+            setattr(sys, name, open(log, "a", encoding="utf-8", buffering=1) if log
+                    else open(os.devnull, "w", encoding="utf-8"))
     # a packaged app has no separate Python: it doubles as the estimator and the glitch CLI
     if len(sys.argv) > 1 and sys.argv[1] == "--estimate-pose":
         import estimate_pose
@@ -3200,6 +3204,15 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
         print(f"{glitch.APP_NAME} {glitch.__version__}")
         raise SystemExit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == "--engine-check":
+        try:                                               # exit 0 = the native engine renders here
+            ok = glitch.native() is not None
+            print(glitch.renderer() if ok else f"python (native engine unavailable: "
+                  f"{__import__('glitch_native').unavailable_reason() or 'turned off'})")
+        except (RuntimeError, ImportError) as ex:
+            ok = False
+            print(f"error: {ex}")
+        raise SystemExit(0 if ok else 3)
     if len(sys.argv) > 1 and sys.argv[1] == "--numba-check":
         st = glitch.fast_status()                          # exit 0 = the compiled kernels run here
         print(json.dumps(st))
@@ -3215,7 +3228,8 @@ def main():
         raise SystemExit(install_resolve(sys.argv[2] if len(sys.argv) > 2 else None))
     ap = argparse.ArgumentParser(prog="Glitcher", description="Glitcher editor. Other modes: "
                                  "--glitch ARGS (renderer CLI), --estimate-pose ARGS, --render-job "
-                                 "JOB.json, --install-resolve [SCRIPTS_DIR], --version")
+                                 "JOB.json, --install-resolve [SCRIPTS_DIR], --version",
+                                 epilog=f"{glitch.PROJECT_URL} (downloads: {glitch.PROJECT_URL}/releases/latest)")
     ap.add_argument("input", nargs="?", help="frames to open")
     ap.add_argument("--job", help="open a DaVinci Resolve job (job.json written by the plugin)")
     args, _unknown = ap.parse_known_args()                 # macOS may add its own arguments

@@ -8,7 +8,7 @@ python -m pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest tests                      # Linux without a display: xvfb-run -a python -m pytest tests
 ```
 
-175 tests, about two minutes on two cores. CI runs them on Windows, macOS and Linux, then builds the
+About 200 tests, about two minutes on two cores. CI runs them on Windows, macOS and Linux, then builds the
 portable app and checks the built app (`tests/smoke_frozen.py`).
 
 ## Why the tests missed the Resolve 1-frame bug
@@ -252,6 +252,34 @@ code).
 
 Not compiled: the motion search (summation order, see `glitch_numba.py`) and the JPEG effect,
 whose 57 ms is mostly indexing and masks rather than the DCT (2.5 ms).
+
+### 2.0.0: the app on the native engine
+
+The engine (`engine/`) has its own tests (`cargo test`: effects, 3D, roll exactness, parts,
+plates, rendering in place, appear / vanish, the shot scan, the C interface) and the Fusion node
+runs against a LuaJIT stand-in of Fusion's API. On the app side, `tests/test_app_native.py`
+checks that `glitch_native.glitch()` accepts glitch.py's frame types and options, that the
+command line renders a full-featured shot (3D, plate, hits, appear, landmarks, follow, glitch
+pass) through it with 1 and 3 workers and gets the same frames twice, that forcing and missing
+the engine behave, and that the editor's preview uses it. The rest of the suite renders with
+the Python renderer (`GLITCHER_ENGINE=python` in `conftest.py`), because it checks that
+renderer's exact pixels.
+
+Checked by hand for 2.0.0: the engine's frames don't depend on its thread count
+(`RAYON_NUM_THREADS` 1, 3 and 8 give identical files), and its 8-bit / float conversions give
+exactly numpy's numbers.
+
+Whole renders on 2 cores (synthetic figure, files included):
+
+| Shot | Python renderer (Numba) | Native engine |
+|---|---|---|
+| 16 frames 3840x2160, intensity 0.9, time effects x2, 3D, one process | 31.4 s | 9.7 s |
+| 24 frames 1920x1080, intensity 0.8, 3D, follow, one process | 9.5 s | 4.7 s |
+
+At HD the engine itself takes ~45 ms a frame; PNG decoding (~14 ms a frame read) and encoding
+take most of the rest. A mosh replays every frame since its event began, so the engine may ask
+for up to 24 earlier frames; the native renderer's processes keep up to 600 MB of decoded
+frames for that (playback workers 150 MB).
 
 ## What is still not covered
 

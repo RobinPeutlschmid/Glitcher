@@ -1,0 +1,24 @@
+[package]
+name = "glitch_core"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Glitcher's native engine: all effects, 3D mode, body parts, plates; C interface"
+license = "MIT"
+repository = "https://github.com/RobinPeutlschmid/Glitcher"
+publish = false
+
+[lib]
+# cdylib = a plain C library (glitch_core.dll / libglitch_core.dylib / .so) that LuaJIT's FFI,
+# Python's ctypes and C++ can all load; rlib = usable from Rust code (the bench below)
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+png = "0.18"
+rayon = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+# panic stays "unwind": the C functions catch panics, so a bug returns an error code instead of
+# taking down the program that loaded the library (Resolve)

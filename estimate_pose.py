@@ -888,13 +888,35 @@ def main(argv=None) -> int:
 
 
 def write_landmarks(path, frames, LM, size):
-    """frames (N,), lm (N, 33, 3) x, y px + visibility (NaN = no person), size (W, H)."""
+    """frames (N,), lm (N, 33, 3) x, y px + visibility (NaN = no person), size (W, H). Writes the
+    .npz (glitch.py) and the same data as a .csv next to it (the native engine / Fusion node,
+    which can't read numpy files)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "wb") as fh:
         np.savez_compressed(fh, frames=np.asarray(frames, np.int64), lm=np.asarray(LM, np.float32),
                             size=np.asarray(size, np.int64))
+    os.replace(tmp, path)
+    write_landmarks_csv(path.with_suffix(".csv"), frames, LM, size)
+
+
+def write_landmarks_csv(path, frames, LM, size):
+    """Landmarks as text: a `size,W,H` line, a header, then `frame, x0, y0, v0, ..., x32, y32, v32`
+    per frame (empty cells = no person)."""
+    path = Path(path)
+    LM = np.asarray(LM, np.float64)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", newline="") as fh:
+        fh.write("# glitcher landmarks: 33 MediaPipe body points per frame, x y in pixels of the "
+                 "size below, v = visibility (empty = no person)\n")
+        fh.write(f"size,{int(size[0])},{int(size[1])}\n")
+        fh.write("frame," + ",".join(f"x{i},y{i},v{i}" for i in range(33)) + "\n")
+        for f, lm in zip(frames, LM):
+            if not np.isfinite(lm[:33, :2]).all():
+                fh.write(f"{int(f)}" + "," * 99 + "\n")
+                continue
+            fh.write(f"{int(f)}," + ",".join(f"{x:.2f},{y:.2f},{v:.3f}" for x, y, v in lm[:33]) + "\n")
     os.replace(tmp, path)
 
 

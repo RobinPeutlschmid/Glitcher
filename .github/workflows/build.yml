@@ -86,6 +86,7 @@ jobs:
       GLITCHER_REQUIRE_MINIAUDIO: "1"
       GLITCHER_REQUIRE_POSE: ${{ matrix.pose && '1' || '0' }}
       GLITCHER_REQUIRE_NUMBA: ${{ matrix.name != 'macos-x64-nopose' && '1' || '0' }}   # no Intel Mac wheels
+      GLITCHER_REQUIRE_NATIVE: "1"     # the app renders with the native engine, built below
     defaults:
       run:
         shell: bash         # the same scripts on all three systems (Git Bash on Windows)
@@ -113,6 +114,20 @@ jobs:
         run: |
           python -m pip install -r requirements.txt -r requirements-dev.txt -c constraints.txt
           python -m pip list
+
+      # the native engine first: the app's tests render with it and the portable build bundles it
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: cargo-app-${{ matrix.name }}-${{ hashFiles('engine/Cargo.lock') }}
+      - name: Build the native engine
+        working-directory: engine
+        run: cargo build --release --lib
 
       - name: Pose model (cached between runs)
         if: matrix.pose
@@ -162,9 +177,63 @@ jobs:
           compression-level: 0      # already a zip
           retention-days: 14
 
+  engine:
+    # the native engine (engine/, Rust) and the Fusion node: tests on every OS, then the library
+    # and the .fuse files as an artifact ("glitcher-fusion-<os>") to drop into Fusion's Fuses folder
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2025, name: windows-x64, lib: glitch_core.dll }
+          - { os: macos-15, name: macos-arm64, lib: libglitch_core.dylib }
+          - { os: ubuntu-24.04, name: linux-x64, lib: libglitch_core.so }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: cargo-${{ matrix.name }}-${{ hashFiles('engine/Cargo.lock') }}
+      - name: Tests
+        run: cargo test --release
+      - name: Build the library
+        run: cargo build --release --lib
+      - name: The Fusion node against a stand-in of Fusion's API (LuaJIT)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q luajit
+          luajit ../fusion/test_glitcher_mock.lua ../fusion/Glitcher.fuse "$PWD/target/release/${{ matrix.lib }}"
+          luajit ../fusion/test_probe_mock.lua ../fusion/GlitcherProbe.fuse "$PWD/target/release/${{ matrix.lib }}"
+      - name: Package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          d="../dist-fusion/Glitcher-Fusion-$VERSION-${{ matrix.name }}"
+          mkdir -p "$d"
+          cp "target/release/${{ matrix.lib }}" ../fusion/Glitcher.fuse ../fusion/GlitcherProbe.fuse ../fusion/NOTES.md ../fusion/README.md "$d/"
+          py="$(command -v python || command -v python3)"     # Windows: "python" (python3 there can be a Store stub)
+          cd ../dist-fusion && "$py" -c "import shutil, sys; shutil.make_archive(sys.argv[1], 'zip', '.', sys.argv[1])" "Glitcher-Fusion-$VERSION-${{ matrix.name }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Glitcher-Fusion-${{ needs.version.outputs.version }}-${{ matrix.name }}
+          path: dist-fusion/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [version, build]
+    needs: [version, build, engine]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

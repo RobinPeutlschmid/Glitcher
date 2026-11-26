@@ -4,6 +4,237 @@ Version numbers: MAJOR.MINOR.PATCH. The version lives in one place, `__version__
 the GUI title, `--version` of every tool, saved presets and the portable build's zip name read it
 from there.
 
+## 2.0.0 — 2026-11-26
+
+**Glitcher 2.0: one native engine for the app and for Fusion.** The editor, its renders and the
+command line now render with `glitch_core` (Rust, multithreaded), the engine the new Fusion node
+uses. The node gains a follow box, motion-reactive timing and a glitch matte output, which
+completes what it needed from the app.
+
+### The app renders with the native engine
+- **Preview, playback, renders, the command line and Resolve jobs** go through `glitch_core`
+  when its library is there, and through the Python renderer otherwise. The planner (layout
+  boxes, follow, curves, hits, motion, audio, appear / vanish, pose) stays in glitch.py and hands
+  each frame's settings to the engine, so every option works as before.
+- **Speed**, measured on 2 cores, whole renders including file reading and writing: a 16-frame
+  4K shot in 9.7 s instead of 31.4 s (3.2x); 24 frames of HD in one process 4.7 s instead of
+  9.5 s (2x). The engine is ~45 ms of an HD frame; the rest is PNG decoding and encoding, which
+  the render workers overlap. Not measured on more cores yet.
+- **Different look, same kind.** The engine draws its own random events, so the same seed gives
+  a different (equally coherent) glitch than 1.x, and the time effects run on the subject before
+  a plate is composited (as in the node). Old projects open and render, but not pixel for pixel
+  as before. `GLITCHER_ENGINE=python` renders with the 1.x renderer.
+- **Render workers:** the engine is multithreaded itself, so a render runs a quarter as many
+  worker processes as there are cores, each with its share of threads, rather than one per
+  core. Workers are started fresh (not forked) when the engine is used. Playback workers use
+  one engine thread each.
+- **Conversions in the engine.** Straight 8-bit / float frames to premultiplied float and back
+  are done on the engine's threads (`gc_premultiply`, `gc_unpremultiply`), with the same
+  arithmetic as before; in numpy they took longer than the render itself.
+- `glitch_native.glitch()` takes glitch.py's `glitch()` arguments and frame types (PIL in, PIL
+  out; float 0..255 in, float out; padding, trim, bbox, shift, 3D angles, reveal, landmarks,
+  body parts, plate) and can also return the glitch matte.
+- `Glitcher --engine-check` (and `python glitch_gui.py --engine-check`) says whether the native
+  engine is used; exit code 0 = yes.
+- **Packaging and CI:** `build_portable.py` bundles the library (building it with cargo if
+  missing; `--no-engine` leaves it out). CI builds the engine before the app's tests, which now
+  require it, and the frozen-app check compares the app's native render and its Python render
+  with the source code's, pixel for pixel. Releases also carry `Glitcher-Fusion-<version>-<os>.zip`
+  (the node and its library).
+- Versions: the app, the engine (`engine/Cargo.toml`) and the Resolve plugin are all 2.0.0, and
+  a test keeps the engine's version equal to the app's.
+
+### Fusion node: follow box, motion-reactive, glitch matte
+- **Follow the subject.** A new layout box mode, and the default in 3D (*Automatic* does what the
+  app does: whole shot in 2D, follow in 3D). The box's centre is the subject's, smoothed over
+  *Follow smoothing* seconds; its size is the shot's typical size (90th percentile), times the
+  pose's scale unless *Ignore pose scale* is ticked. It comes from the shot scan, like the
+  whole-shot box.
+- **Motion-reactive** (0..1). The shot scan also measures how much the subject changes from frame
+  to frame (on a ~160 px grey copy of brightness and alpha), smoothed and scaled to the shot's
+  95th percentile, as the app's motion curve. Calm frames get less glitch, fast ones more, and
+  the sharpest a burst.
+- **Glitch matte**, a second output: where the output differs from both the clean subject (on the
+  plate) and the plate, ramped over 2..64 levels as the app's glitch pass, in R, G, B and alpha.
+  *Advanced → Glitch matte output* turns it off.
+- C interface ABI 8: `GcParams` gains `follow`, `motion`, and `reveal_set` / `reveal_idx` /
+  `reveal_set_q` / `landmarks` (a frame planned by the host: the app hands over its own reveal
+  and landmarks); `GcStats` gains `motion` and `layout_from`; `gc_render` takes a matte image.
+
+### Earlier steps of the native engine and Fusion node (0.1-0.9, unreleased)
+- **`engine/` (glitch_core, Rust): the start of the native engine.**
+  - Contains the scheduler and the time effects: echo, stutter and mosh. The other effects
+    come next.
+  - Works in premultiplied float, and renders the same frames on every OS and CPU (no
+    platform maths library in pixel code).
+  - Has a C interface that the Fusion node, Python and later OpenFX share.
+  - The same statistics as glitch.py (how often each effect shows and how much it covers),
+    with different random draws.
+  - At 4K on 2 cores: echo ~70 ms, stutter ~30 ms, mosh ~125 ms per active frame.
+- **`fusion/Glitcher.fuse`: the Glitcher node** for Resolve's Fusion page and Fusion Studio.
+  - Controls: seed, intensity, tempo, density, bursts, and an Echo / Stutter / Mosh strength.
+  - Fetches only the earlier frames the engine asks for, and hands Fusion's float images to
+    the engine in place.
+  - `fusion/GlitcherProbe.fuse` and `fusion/NOTES.md` record what Fusion exposes to a node,
+    including the pixel layout.
+- `glitch_native.py`: the engine from Python (ctypes).
+- **Engine 0.9.1: pose estimation fixed in Resolve** (from the first real run).
+  - **Range.** The node couldn't read the clip's frame range while rendering, so it stored
+    and scanned only frame 0. It now reads the range from the UI side, where the comp is
+    reachable: on any control change or button press. It writes the range into a new
+    **Shot frames** field (editable), and the render uses that. If no range can be read, the
+    Console says so and the layout uses this frame's box.
+  - **Duplicates.** Resolve runs several copies of a node's script side by side, each with its
+    own engine, so every copy started its own pose run and the estimator ran again and again.
+    Pose runs (keyed by folder) and shot scans (keyed by a hidden per-node id) are now shared by
+    every engine in the process, so there is one run and one estimator process. A finished-run
+    marker now includes the range.
+  - Tests: the Fusion stand-in now refuses comp attributes while rendering, as Resolve seems to.
+    It runs two copies of the node side by side and checks one estimator run and one shot scan.
+  - C interface: `gc_shot_begin` is replaced by `gc_shot_open(engine, key, generation, ...)`.
+- **Engine 0.9.0: appear and vanish** - the last part of glitch.py's look the engine lacked.
+  - **The transition.** The subject builds up out of glitch structure (appear) or breaks apart
+    and goes (vanish). This uses glitch.py's reveal map: arrival times swept over the layout
+    box, blocks and row bands, ranked so progress q reveals a q share. Pixels in transit are
+    shoved sideways in slices, become mosaic blocks and get a glow colour.
+  - **Around it.** The glitch peaks mid-transition (0.9 x sin(pi q), as a hit) and is masked
+    to where the subject exists, a little ahead of the front. Before the first appear or
+    after a vanish the subject is hidden; with a plate the result is then the clean plate.
+  - The timeline rules (which transition is running, progress, hidden / visible) match
+    `Timing.reveal`, checked on the same cases. The pattern is drawn from the engine's own
+    random numbers, so it looks like the app's in kind, not pixel for pixel.
+  - Node: *Appear at* / *Vanish at* lists, *Appear / vanish length*, and *Appear here*,
+    *Vanish here*, *Remove here* at the playhead. Show pose and the Debug log show the state.
+  - C interface ABI 7: `GcParams` gains `appear`, `vanish` and `trans_len`; `GcStats` gains
+    `reveal` and `reveal_q`.
+- **Engine 0.8.0: the app's layout box, and hits.**
+  - **Layout box.** The app lays effects out in the union of the subject's boxes over the whole
+    shot (`_plan_boxes`), but the node used only the current frame's subject box, so its
+    glitches stayed closer to the body. Measured on a subject drifting across the frame (16
+    seeds): glitch.py's whole-shot path puts 5,692 px per frame outside the subject; the node
+    put 4,811, and now puts 5,677 with the new default **Whole shot**. The node scans the
+    render range once (`gc_shot_*`; the scan is kept while Resolve runs, *Rescan shot*
+    redoes it). *This frame's subject* keeps the old layout, and *Box grow* enlarges either box.
+    The earlier first measurement (half as much outside the subject) was seed noise: with
+    enough seeds the engine matched glitch.py for the same box.
+  - **Hits**, as glitch.py's `--hits` and the app's timing: frame[:strength[:seconds]]. Activity
+    jumps to full, intensity rises to at least the strength, effects get up to 2x the events,
+    and it all decays over the length. The envelope matches `Timing.hit` to 5 decimals. In the
+    node: a *Hits* list, *Add hit here* / *Remove hit here* at the playhead, *Hit strength*
+    and *Hit length*. A malformed list is ignored, with a Console line (warn bit 16).
+  - The Debug log also shows the input and output images' domain of definition (`dod=`), to
+    check whether Fusion crops anything the glitch draws outside the subject. With Show pose
+    on, the overlay shows the hit level and the layout box.
+  - C interface ABI 6: `GcParams` gains `layout_mode`, `layout`, `box_grow`, `hits` and
+    `hit_len`; `GcStats` gains `hit`.
+- **Engine 0.7.0: see the pose the node uses.** The Yaw / Pitch / Roll sliders are offsets on
+  top of the pose file and never show its values, so nothing in the Inspector showed whether
+  a pose was used. New **3D → Show pose** draws over the output:
+  - the landmark skeleton (subject's left orange, right blue);
+  - the 3D camera as a ring around the body, with a facing arrow and an up line;
+  - the angles used on that frame, and whether the pose and landmark files were read.
+
+  The Debug log prints the same angles (`view=`). C interface ABI 5: `GcParams._pad` becomes
+  `overlay`, and `GcStats` gains `has_view` and `view` (yaw × lock, pitch, roll, camera
+  distance). The node's FFI types are renamed (`GcParams5`, `GcStats5`) so a reloaded node
+  can't clash with the old layout.
+- **Engine 0.6.0: pose estimation in the node.** Pressing *Estimate pose* starts a run, and
+  playing or scrubbing the shot once does the rest. The node stores its input frames as
+  PNGs; each render also fetches a few missing ones, within 250 ms, so Fusion stays
+  responsive. Then it runs `estimate_pose.py`, or the Glitcher app's `--estimate-pose`, in the
+  background with the comp's frame numbers. The pose and landmark fields point at the result,
+  and *Reload pose* re-renders with it. Yaw / pitch / roll hints re-solve in seconds from the
+  landmark cache, and *Start over* re-captures. Progress and errors go to the Console.
+  - Engine: `posejob` (capture with conversion to straight 8-bit sRGB, box
+    downscale, PNG writing on worker threads, launching, progress from the estimator's
+    `--progress` lines, a done marker so a reopened comp doesn't run it again), and the C
+    functions `gc_pose_request`, `gc_pose_feed`, `gc_pose_missing`, `gc_pose_status`,
+    `gc_pose_sizes`. New dependency: the `png` crate (pure Rust).
+  - The Glitcher app: started without console handles (windowed build), it writes its output
+    to `GLITCHER_LOG` when set, so the node can show the estimator's progress and errors.
+  - Tested: a stand-in estimator run end to end from the Rust tests and from the Fusion
+    stand-in. `estimate_pose.py` with MediaPipe also ran on frames the engine stored; it
+    accepted every argument and read every frame.
+- **Engine 0.5.0: 3D mode, body parts and plates** — everything of glitch.py's look except
+  reveals.
+  - **3D mode**: each frame effect's event is a plane in a volume around the body
+    (glitch.py's `Space3D` / `_place`), three times as many are spawned, and each plane effect
+    runs twice, once for the planes in front of the body and once for those behind it. What the
+    behind pass changes goes *under* the front result. RGB split gets its depth parallax. With
+    a roll the planes are laid out in an upright working frame (premultiplied bicubic) and
+    only the pixels the glitch changed are turned back, so the rest of the frame stays exact.
+  - **Angles** from estimate_pose.py's pose CSV (read by the engine: interpolated, optional
+    Gaussian smoothing, optional yaw unwrap), plus yaw / pitch / roll values that are added to
+    it; lock, camera distance (or the file's `cam_dist`), depth and tilt as in glitch.py.
+  - **Body parts**: *only*, *protect* and per-effect *targets*, as capsules around the
+    MediaPipe landmarks at quarter resolution (glitch.py's `part_mask`). In a rolled shot the
+    per-effect masks turn with the working frame.
+  - **Plates**: the subject over the plate, a spill mask (glitch.py's `_spill_mask`: Chebyshev
+    distance on an 8 px grid, smoothstep falloff) limits the damage, and the result goes over
+    the plate again so there are no holes. One deliberate difference: the time effects run on
+    the subject before compositing (see `fusion/README.md`).
+  - **Landmarks as text**: estimate_pose.py now also writes `<pose>_landmarks.csv` next to the
+    `.npz`. The engine reads it without numpy, and glitch.py reads either.
+    `tools/landmarks_csv.py` converts older `.npz` files.
+  - **Faster frame effects**: each effect used to copy the whole content area before it
+    started. Now the picture "before" is copy-on-write in 64 px tiles: an effect saves only
+    the tiles it is about to write, and reads everything else live. Writers borrow only their
+    own pixels of a row, so the reads stay sound. At 4K on 2 cores this took the 2-D
+    median from 339 to 175 ms, the rolled 3D one from 625 to 316 ms and plates from 571 to
+    303 ms.
+  - Checked against glitch.py with `tools/compare_native.py --scene 3d|roll|parts|plate` on a
+    synthetic figure: the frame effects' statistics agree within a few percent in every
+    scene. The protected head stays untouched in both, and neither damages the plate beyond the
+    spill area.
+  - New tests: every pixel an effect changes lies in the area it reports (2-D and both 3-D
+    passes; the layering relies on it). A rolled frame with the effects off comes out
+    bit-identical. *Protect* and *only* keep their areas exactly clean in 2-D, 3-D and rolled.
+    A plate is never touched beyond the spill mask. In-place rendering equals rendering to a
+    separate output.
+  - C interface **ABI 4**: `GcParams` gains the 3D, track-file, body-part and spill fields.
+    `gc_render` gains a plate image, and `GcStats` gains `flags` and `warn`. New functions:
+    `gc_last_error`, `gc_parse_parts`, `gc_parse_targets`, and `gc_sizes`, which the node and
+    `glitch_native.py` use to check their struct layouts against the library.
+  - Node: a **Plate** input and collapsible **Effects / 3D / Body parts / Plate / Advanced**
+    groups. Pose and landmark files are picked with a file browser, and there is a Track
+    frame offset. Warnings go to the Console, and the debug log shows the track frame and mode.
+    Usage: `fusion/README.md`.
+- **Engine 0.4.0: all thirteen effects.** The ten frame effects are ported in their 2-D form:
+  JPEG, blocks, slices, wave, pixel sort, smear, RGB split, tint, scanlines and noise.
+  - Colour changes are computed on the straight colour and premultiplied again, so they look
+    like glitch.py's. Effects that only move pixels move premultiplied ones.
+  - Against glitch.py, `tools/compare_native.py` measured each effect alone on 4 seeds × 100
+    frames: frames hit, share of the subject covered and strength all agree within a few
+    percent. JPEG is slightly weaker (99 against 116): its noise is a hash-based
+    near-Gaussian, with lighter tails than numpy's.
+  - The engine tracks the area that holds content as effects write. So no effect scans or
+    copies the whole frame to find the subject, and each one snapshots only that area.
+    A test checks the tracked area never misses a pixel.
+  - Speed at 4K on 2 cores, all effects: median 210 ms per frame at the defaults, 530 ms at
+    intensity 1 with every effect at 2.
+  - The node exposes a strength for every effect, plus Tint amount and JPEG quality.
+  - C interface ABI 3: `GcParams` gains tint, quality and bleed; `GcStats` gains a count per
+    frame effect.
+  - Not ported yet in 0.4.0: 3-D mode, body parts, plates and reveals (all but reveals came in
+    0.5.0).
+- **Engine 0.3.0, so the node works during playback.** Resolve's Fusion page hands a node
+  32-bit float frames when scrubbing (Depth 8) and 16-bit float ones during playback
+  (Depth 7). The node only took 32-bit, so in playback it passed every frame through. The
+  engine now takes float32 in place and converts float16, uint16 and uint8 in and out
+  (exact half-float conversion, tested on all 65536 values), and the history can mix formats
+  frame by frame.
+  - The node tells float16 from uint16 (both 2-byte channels) by checking against
+    `GetPixel`, once per Depth code.
+  - C interface ABI 2: `GcImage` gains `format`, and its stride counts channel values.
+- Node: a **Debug log** option (one line per frame: what Fusion asked for, which earlier
+  frames arrived and in what format, what the engine did). It is also marked time-variant now,
+  and answers pre-calc requests without rendering.
+- `tools/compare_native.py`: glitch.py and the engine side by side, with statistics and a
+  contact sheet.
+- CI builds and tests the engine on Windows, macOS and Linux, tests the node against a
+  stand-in of Fusion's API, and uploads `glitcher-fusion-<os>` (the library plus the .fuse
+  files).
+
 ## 1.7.0 — 2026-11-25
 
 ### Faster

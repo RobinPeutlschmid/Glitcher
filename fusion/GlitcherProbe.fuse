@@ -1,0 +1,280 @@
+--[[
+GlitcherProbe.fuse - a test node, not the effect. It answers what the real Glitcher node needs:
+
+  1. Does this Fusion / Resolve load a native library through LuaJIT's FFI?
+  2. Does it hand the node an earlier frame (GetSource), and how long does that take?
+  3. Where are an image's pixels in memory (GetScanLine / GetChanSize), and do they agree with
+     the documented GetPixel?
+  4. The engine run on the real pixels in place: input + the earlier frame -> output (you
+     should see a faint cyan echo to the right of the subject, and grain), and how long the
+     whole node takes per frame.
+
+Install: copy this file into Fusion's Fuses folder (Windows, Resolve:
+%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Fuses), restart Resolve or press
+Reload in the inspector. Add it on the Fusion page (Shift+Space, "GlitcherProbe") after a
+MediaIn, put the full path to glitch_core.dll into "Library" (quotes are fine, or set the
+GLITCHER_CORE environment variable before starting Resolve), view it, step a few frames. If
+the node shows no controls, Create() failed: the error is in the Console.
+Results print to the Console (Workspace > Console) and to glitcher_probe.txt in your temp
+folder - send that file.
+]]
+
+FuRegisterClass("GlitcherProbe", CT_Tool, {
+    REGS_Category = "Glitcher",
+    REGS_OpIconString = "GlP",
+    REGS_OpDescription = "Glitcher test node: native library, earlier frames, pixel access",
+    REG_NoMotionBlurCtrls = true,
+    REG_NoBlendCtrls = true,
+    REG_NoObjMatCtrls = true,
+    REG_OpNoMask = true,
+})
+
+function Create()
+    -- image in/out first: if anything below failed, the node would still pass the image through
+    InImage = self:AddInput("Input", "Input", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+    InLib = self:AddInput("Library", "Library", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "TextEditControl",
+        TEC_Lines = 1,
+        INPS_DefaultText = (os and os.getenv and os.getenv("GLITCHER_CORE")) or "",  -- not INP_Default
+    })
+    InLag = self:AddInput("Lag (frames)", "Lag", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Integer = true,
+        INP_MinScale = 1,
+        INP_MaxScale = 24,
+        INP_Default = 12,
+    })
+end
+
+local CDEF = [[
+const char* gc_version(void);
+int gc_threads(void);
+double gc_now_ms(void);
+double gc_spike(const float* cur, const float* prev, float* out, int32_t width, int32_t height,
+                int64_t stride, int32_t frame, uint32_t seed, float strength, int32_t dx);
+]]
+
+local ffi_ok, ffi = pcall(require, "ffi")
+local lib, lib_path, lib_err, cdef_done
+local lines
+
+local function say(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
+    local s = table.concat(parts, " ")
+    print("[GlitcherProbe] " .. s)
+    lines[#lines + 1] = s
+end
+
+local function now_ms()
+    if lib then return lib.gc_now_ms() end
+    return os.clock() * 1000                              -- CPU time: only a fallback
+end
+
+local function clean_path(path)
+    -- "Copy as path" in Explorer wraps the path in quotes; spaces sneak in when pasting
+    path = tostring(path or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    return (path:gsub('^"(.*)"$', "%1"):gsub("^'(.*)'$", "%1"))
+end
+
+local function load_lib(path)
+    if not ffi_ok then return nil, "no FFI: " .. tostring(ffi) end
+    if path == "" then return nil, "no library path given" end
+    local f = io.open(path, "rb")
+    if not f then return nil, "no file at " .. path .. " (built it? cargo build --release)" end
+    f:close()
+    if not cdef_done then
+        local ok, e = pcall(ffi.cdef, CDEF)
+        if not ok then return nil, "ffi.cdef failed: " .. tostring(e) end
+        cdef_done = true
+    end
+    local ok, l = pcall(ffi.load, path)                   -- full path: ffi.load only searches PATH
+    if not ok then
+        return nil, tostring(l) .. " (the file exists, so a library it needs is missing)"
+    end
+    return l
+end
+
+local function write_report()
+    local dir = os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp"
+    local sep = package.config:sub(1, 1)
+    local f = io.open(dir .. sep .. "glitcher_probe.txt", "w")
+    if f then
+        f:write(table.concat(lines, "\n"), "\n")
+        f:close()
+        print("[GlitcherProbe] report written to " .. dir .. sep .. "glitcher_probe.txt")
+    end
+end
+
+local function addr(ptr)
+    return tonumber(ffi.cast("uintptr_t", ptr))
+end
+
+-- Where an image's pixels are: base pointer (lowest row), row stride in floats, and whether
+-- the rows are evenly spaced (the engine needs that to use the memory in place).
+--
+-- What Resolve showed so far: GetScanLine(y) returns an `unsigned char **` that is the SAME
+-- address for every y - a slot the call fills with that row's pointer. So the row pointer is
+-- p[0], read right after each call (the next call overwrites it) - or, if p[0] is the same
+-- for every row, p is a table of all row pointers and the row is p[y]. GetChanSize() wants an
+-- argument (which one isn't documented), so the bytes per pixel come from the row spacing.
+local row_mode = "slot"                                     -- or "table", see above
+
+local function row_ptr(img, y)
+    local ok, pp = pcall(function() return img:GetScanLine(y) end)
+    if not ok or pp == nil then return nil, tostring(pp) end
+    local okD, r = pcall(function() return row_mode == "slot" and pp[0] or pp[y] end)
+    if not okD or r == nil then return nil, "could not read the row pointer: " .. tostring(r) end
+    return r
+end
+
+local function chan_size_tries(img)
+    local out = {}
+    local names = { "CHAN_RED", "CHAN_ALPHA" }
+    for _, n in ipairs(names) do
+        if _G[n] ~= nil then
+            local ok, v = pcall(function() return img:GetChanSize(_G[n]) end)
+            out[#out + 1] = ("GetChanSize(%s=%s) -> %s"):format(n, tostring(_G[n]), tostring(v))
+        end
+    end
+    for _, v in ipairs({ 0, 1 }) do
+        local ok, r = pcall(function() return img:GetChanSize(v) end)
+        out[#out + 1] = ("GetChanSize(%d) -> %s"):format(v, ok and tostring(r) or "error")
+    end
+    return table.concat(out, ", ")
+end
+
+local function half_to_float(hbits)                          -- IEEE binary16 -> number
+    local sign = hbits >= 0x8000 and -1 or 1
+    local e = math.floor(hbits / 1024) % 32
+    local m = hbits % 1024
+    if e == 0 then return sign * m * 2 ^ -24 end
+    if e == 31 then return m == 0 and sign * math.huge or 0 / 0 end
+    return sign * (1 + m / 1024) * 2 ^ (e - 15)
+end
+
+local function layout(img, label)
+    local w, h = img.Width, img.Height
+    say(("%s: Depth %s; %s"):format(label, tostring(img.Depth), chan_size_tries(img)))
+    local addrs
+    for _, mode in ipairs({ "slot", "table" }) do
+        row_mode, addrs = mode, {}
+        for _, y in ipairs({ 0, 1, 2, h - 1 }) do
+            local r, err = row_ptr(img, y)
+            if not r then
+                say(("%s: row %d pointer (%s): %s"):format(label, y, mode, err))
+                return nil
+            end
+            addrs[y] = addr(r)
+        end
+        if addrs[1] ~= addrs[0] then break end              -- rows differ: this reading is right
+    end
+    say(("%s: GetScanLine(y) read as %s"):format(label, row_mode == "slot" and "p[0] (one slot, refilled per call)" or "p[y] (a table of row pointers)"))
+    local d01, d12 = addrs[1] - addrs[0], addrs[2] - addrs[1]
+    local dlast = addrs[h - 1] - addrs[0]
+    local even = d01 ~= 0 and d01 == d12 and dlast == d01 * (h - 1)
+    local step = math.abs(d01)
+    local bpp = step / w                                     -- bytes per pixel, if rows are unpadded
+    say(("%s: row 0 at 0x%x; rows %d bytes apart (%s), %s; %.2f bytes per pixel")
+        :format(label, addrs[0], d01, d01 < 0 and "bottom row last in memory" or "bottom row first",
+                even and "evenly spaced" or "NOT evenly spaced", bpp))
+    if not even then return nil end
+    local fmt = (bpp >= 16 and bpp < 17) and "float32" or (bpp >= 8 and bpp < 9) and "float16"
+             or (bpp >= 4 and bpp < 5) and "int8" or "unknown"
+    -- check the format against GetPixel, at the centre pixel
+    local p = Pixel()
+    local x, y = math.floor(w / 2), math.floor(h / 2)
+    img:GetPixel(x, y, p)
+    local r = row_ptr(img, y)
+    local mem
+    if fmt == "float32" then
+        local f = ffi.cast("float*", r)
+        mem = { f[4 * x], f[4 * x + 1], f[4 * x + 2], f[4 * x + 3] }
+    elseif fmt == "float16" then
+        local hb = ffi.cast("uint16_t*", r)
+        mem = { half_to_float(hb[4 * x]), half_to_float(hb[4 * x + 1]), half_to_float(hb[4 * x + 2]), half_to_float(hb[4 * x + 3]) }
+    elseif fmt == "int8" then
+        local b = ffi.cast("uint8_t*", r)
+        mem = { b[4 * x] / 255, b[4 * x + 1] / 255, b[4 * x + 2] / 255, b[4 * x + 3] / 255 }
+    end
+    if mem then
+        say(("%s: as %s, pixel (%d,%d): GetPixel R G B A = %.4f %.4f %.4f %.4f | memory = %.4f %.4f %.4f %.4f")
+            :format(label, fmt, x, y, p.R, p.G, p.B, p.A, mem[1], mem[2], mem[3], mem[4]))
+    else
+        say(("%s: unknown pixel format (%.2f bytes per pixel)"):format(label, bpp))
+    end
+    if fmt ~= "float32" then
+        say(label .. ": not float32 RGBA - the engine will need a " .. fmt .. " path (skipping it here)")
+        return nil
+    end
+    local base = d01 >= 0 and addrs[0] or addrs[h - 1]
+    return { base = ffi.cast("float*", base), stride = step / 4 }
+end
+
+function Process(req)
+    lines = {}
+    local t_start = lib and lib.gc_now_ms() or 0
+    local img = InImage:GetValue(req)
+    local lag = math.max(1, math.floor(InLag:GetValue(req).Value + 0.5))
+    local path = clean_path(InLib:GetValue(req).Value)
+
+    say("time", req.Time, "| LuaJIT", jit and jit.version or "?", "| FFI", ffi_ok and (ffi.os .. "/" .. ffi.arch) or "missing")
+    if path ~= lib_path then
+        lib, lib_err = load_lib(path)
+        lib_path = path
+    end
+    if lib then
+        say("library OK: glitch_core", ffi.string(lib.gc_version()), "threads", lib.gc_threads())
+    else
+        say("library NOT loaded:", lib_err)
+    end
+
+    local w, h = img.Width, img.Height
+    say(("image %dx%d"):format(w or -1, h or -1))
+
+    -- 2. an earlier frame
+    local t0 = now_ms()
+    local okP, prev = pcall(function() return InImage:GetSource(req.Time - lag) end)
+    local t_src = now_ms() - t0
+    if okP and prev then
+        say(("GetSource(time - %d): %dx%d in %.1f ms"):format(lag, prev.Width or -1, prev.Height or -1, t_src))
+    else
+        say(("GetSource(time - %d) failed or empty: %s (%.1f ms)"):format(lag, tostring(prev), t_src))
+        prev = nil
+    end
+
+    -- 3. raw memory: where the pixels are, in what format, checked against GetPixel
+    local L = ffi_ok and layout(img, "input") or nil
+
+    -- 4. the engine on the real pixels, in place: input (+ earlier frame) -> output
+    local out = img
+    if lib and L then
+        t0 = now_ms()
+        out = img:CopyOf()
+        local t_copy = now_ms() - t0
+        local O = layout(out, "output")
+        local P = prev and prev.Width == w and prev.Height == h and layout(prev, "earlier") or nil
+        if O and O.stride == L.stride and (not P or P.stride == L.stride) then
+            local ms = lib.gc_spike(L.base, P and P.base or nil, O.base, w, h, L.stride, req.Time, 7, 1.0,
+                                    math.floor(w * 0.02))
+            say(("engine echo + grain on the real %dx%d image: %.1f ms (CopyOf for the output: %.1f ms)")
+                :format(w, h, ms, t_copy))
+        else
+            say("engine skipped: output / earlier frame memory doesn't match the input's layout")
+            out = img
+        end
+        say(("whole node, this frame: %.1f ms"):format(lib.gc_now_ms() - t_start))
+    end
+
+    write_report()
+    OutImage:Set(req, out)
+end
